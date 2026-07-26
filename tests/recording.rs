@@ -1,0 +1,343 @@
+use std::io::Cursor;
+use std::sync::mpsc;
+use std::sync::Arc;
+
+use trai::domain::SpeakerTag;
+use trai::recording::{Recording, RecordingParams};
+use trai::segmenter::{SegmentEvent, Segmenter, SpeechSpan, FRAME_LEN, SAMPLE_RATE_HZ};
+use trai::store;
+use trai::transcriber::{FakeTranscriber, Transcription};
+
+const VAD_THRESHOLD: f32 = 0.5;
+const SILENCE_HOLD_MS: u64 = 200;
+const DURATION_CAP_MS: u64 = 20_000;
+
+fn synthetic_speech_frame(len: usize, phase_start: usize, formants: &[f32]) -> Vec<i16> {
+    (phase_start..phase_start + len)
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE_HZ as f32;
+            let mut sample = 0.0f32;
+            for &f in formants {
+                sample += (2.0 * std::f32::consts::PI * f * t).sin();
+            }
+            (sample / formants.len() as f32 * 22000.0) as i16
+        })
+        .collect()
+}
+
+fn build_stream_samples(formants: &[f32]) -> Vec<i16> {
+    let lead_silence_len = FRAME_LEN * 10;
+    let speech_len = FRAME_LEN * 20;
+    let trail_silence_len = FRAME_LEN * 40;
+
+    let mut samples = vec![0i16; lead_silence_len];
+    samples.extend(synthetic_speech_frame(
+        speech_len,
+        lead_silence_len,
+        formants,
+    ));
+    samples.extend(vec![0i16; trail_silence_len]);
+    samples
+}
+
+fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+// Runs the same Segmenter algorithm the Recording under test will run,
+// against the full known PCM, to learn the exact sample range it will
+// carve out as a Segment before we register that range with the fake.
+fn expected_span(samples: &[i16]) -> SpeechSpan {
+    let mut segmenter = Segmenter::new(VAD_THRESHOLD, SILENCE_HOLD_MS, DURATION_CAP_MS);
+    let mut spans: Vec<SpeechSpan> = segmenter
+        .push_samples(samples)
+        .into_iter()
+        .filter_map(|event| match event {
+            SegmentEvent::Closed(span) => Some(span),
+            _ => None,
+        })
+        .collect();
+    if let Some(span) = segmenter.finish() {
+        spans.push(span);
+    }
+    assert_eq!(
+        spans.len(),
+        1,
+        "expected exactly one span, got {}",
+        spans.len()
+    );
+    spans[0]
+}
+
+#[test]
+fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript() {
+    let mic_formants = [180.0, 420.0, 900.0, 1800.0, 2600.0];
+    let monitor_formants = [220.0, 500.0, 1100.0, 2000.0, 3000.0];
+
+    let mic_samples = build_stream_samples(&mic_formants);
+    let monitor_samples = build_stream_samples(&monitor_formants);
+
+    let mic_span = expected_span(&mic_samples);
+    let monitor_span = expected_span(&monitor_samples);
+
+    let mic_segment_samples =
+        mic_samples[mic_span.start_sample as usize..mic_span.end_sample as usize].to_vec();
+    let monitor_segment_samples = monitor_samples
+        [monitor_span.start_sample as usize..monitor_span.end_sample as usize]
+        .to_vec();
+
+    let fake = Arc::new(FakeTranscriber::new());
+    let mic_call = fake.expect_call(mic_segment_samples);
+    let monitor_call = fake.expect_call(monitor_segment_samples);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+
+    let params = RecordingParams {
+        store_dir: store_dir.clone(),
+        mic_source: "unused".to_string(),
+        monitor_source: "unused".to_string(),
+        mic_language: Some("en".to_string()),
+        monitor_language: None,
+        vad_threshold: VAD_THRESHOLD,
+        silence_hold_ms: SILENCE_HOLD_MS,
+        duration_cap_ms: DURATION_CAP_MS,
+        confidence_floor: 0.0,
+    };
+
+    let recording = Recording::start_with_sources(
+        Cursor::new(pcm_bytes(&mic_samples)),
+        Cursor::new(pcm_bytes(&monitor_samples)),
+        params,
+        fake.clone(),
+    )
+    .unwrap();
+
+    // Both in-memory Cursors get drained in microseconds with no
+    // real-time pacing (unlike a live pw-record stream), so give both
+    // reader threads a generous margin to reach their blocked
+    // transcribe() call before releasing either response. Without
+    // this, one stream's segment could finish and flush before the
+    // other stream's reader thread has even submitted its own earlier
+    // segment, which this test isn't set up to arbitrate.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    mic_call.respond(Transcription {
+        text: "mic said something".to_string(),
+        mean_confidence: 0.9,
+    });
+    monitor_call.respond(Transcription {
+        text: "monitor said something".to_string(),
+        mean_confidence: 0.85,
+    });
+
+    recording.stop().unwrap();
+
+    let segments = store::read_all(&store_dir.join("segments.jsonl")).unwrap();
+    assert_eq!(segments.len(), 2, "both segments must be persisted");
+    assert!(
+        segments.windows(2).all(|w| w[0].start_ms <= w[1].start_ms),
+        "segments must be ordered by start_ms"
+    );
+
+    let mic_segment = segments
+        .iter()
+        .find(|s| s.speaker_tag == SpeakerTag::Me)
+        .expect("mic segment must be present and tagged Me");
+    assert_eq!(mic_segment.text, "mic said something");
+
+    let monitor_segment = segments
+        .iter()
+        .find(|s| s.speaker_tag == SpeakerTag::Them)
+        .expect("monitor segment must be present and tagged Them");
+    assert_eq!(monitor_segment.text, "monitor said something");
+
+    let mic_wav_path = store_dir.join("mic.wav");
+    let monitor_wav_path = store_dir.join("monitor.wav");
+    assert!(mic_wav_path.exists());
+    assert!(monitor_wav_path.exists());
+
+    let mic_reader = hound::WavReader::open(&mic_wav_path).unwrap();
+    assert_eq!(mic_reader.duration() as usize, mic_samples.len());
+
+    let monitor_reader = hound::WavReader::open(&monitor_wav_path).unwrap();
+    assert_eq!(monitor_reader.duration() as usize, monitor_samples.len());
+}
+
+// A source the test can feed on its own schedule: `read()` blocks on
+// the channel whenever its internal buffer is drained, standing in
+// for a live stream whose next bytes (e.g. the silence that would
+// close a still-open span) simply haven't arrived yet. Dropping the
+// sender closes the channel, which surfaces as ordinary EOF.
+struct ChunkedReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ChunkedReader {
+    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl std::io::Read for ChunkedReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
+    let mic_formants = [180.0, 420.0, 900.0, 1800.0, 2600.0];
+    let monitor_formants = [220.0, 500.0, 1100.0, 2000.0, 3000.0];
+
+    // mic opens early and, unlike every other stream in this file, is
+    // fed through a channel instead of a finite Cursor: we send its
+    // lead-silence-plus-speech onset and then deliberately withhold
+    // the trailing silence that would close it, so its span stays
+    // open on purpose while the rest of this scenario plays out.
+    let mic_lead_silence_len = FRAME_LEN * 10;
+    let mic_speech_len = FRAME_LEN * 20;
+    let mic_trail_silence_len = FRAME_LEN * 40;
+
+    let mut mic_onset_samples = vec![0i16; mic_lead_silence_len];
+    mic_onset_samples.extend(synthetic_speech_frame(
+        mic_speech_len,
+        mic_lead_silence_len,
+        &mic_formants,
+    ));
+    let mic_trail_samples = vec![0i16; mic_trail_silence_len];
+
+    let mut mic_full_samples = mic_onset_samples.clone();
+    mic_full_samples.extend(mic_trail_samples.iter().copied());
+
+    // monitor opens later (bigger lead silence -> bigger start_ms)
+    // but is a plain, finite Cursor that closes and submits within
+    // microseconds of the recording starting.
+    let monitor_lead_silence_len = FRAME_LEN * 40;
+    let monitor_speech_len = FRAME_LEN * 20;
+    let monitor_trail_silence_len = FRAME_LEN * 40;
+
+    let mut monitor_samples = vec![0i16; monitor_lead_silence_len];
+    monitor_samples.extend(synthetic_speech_frame(
+        monitor_speech_len,
+        monitor_lead_silence_len,
+        &monitor_formants,
+    ));
+    monitor_samples.extend(vec![0i16; monitor_trail_silence_len]);
+
+    let mic_span = expected_span(&mic_full_samples);
+    let monitor_span = expected_span(&monitor_samples);
+    assert!(
+        mic_span.start_sample < monitor_span.start_sample,
+        "mic must open before monitor for this scenario to be meaningful"
+    );
+
+    let mic_segment_samples =
+        mic_full_samples[mic_span.start_sample as usize..mic_span.end_sample as usize].to_vec();
+    let monitor_segment_samples = monitor_samples
+        [monitor_span.start_sample as usize..monitor_span.end_sample as usize]
+        .to_vec();
+
+    let fake = Arc::new(FakeTranscriber::new());
+    let mic_call = fake.expect_call(mic_segment_samples);
+    let monitor_call = fake.expect_call(monitor_segment_samples);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+    let segments_path = store_dir.join("segments.jsonl");
+
+    let params = RecordingParams {
+        store_dir: store_dir.clone(),
+        mic_source: "unused".to_string(),
+        monitor_source: "unused".to_string(),
+        mic_language: None,
+        monitor_language: None,
+        vad_threshold: VAD_THRESHOLD,
+        silence_hold_ms: SILENCE_HOLD_MS,
+        duration_cap_ms: DURATION_CAP_MS,
+        confidence_floor: 0.0,
+    };
+
+    let (mic_tx, mic_rx) = mpsc::channel::<Vec<u8>>();
+    let mic_reader = ChunkedReader::new(mic_rx);
+
+    let recording = Recording::start_with_sources(
+        mic_reader,
+        Cursor::new(pcm_bytes(&monitor_samples)),
+        params,
+        fake.clone(),
+    )
+    .unwrap();
+
+    mic_tx.send(pcm_bytes(&mic_onset_samples)).unwrap();
+    // Generous margin for the mic reader thread to process the onset
+    // chunk and call pipeline.begin() before we touch monitor's
+    // response; without it we couldn't guarantee mic's span is
+    // registered as open by the time monitor's segment tries to flush.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Monitor's short segment (later start_ms) was a plain, finite
+    // Cursor, so it has already closed and submitted by now. Release
+    // its transcription while mic's span is still open.
+    monitor_call.respond(Transcription {
+        text: "monitor said something".to_string(),
+        mean_confidence: 0.85,
+    });
+
+    // Give the monitor submission thread time to retire from
+    // in_flight, insert its segment, and attempt a flush. This is
+    // exactly the window in which the bug this test targets would
+    // write monitor's segment to disk ahead of mic's, before mic has
+    // even closed: if an open span isn't registered until it closes,
+    // nothing here is holding the watermark back.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mid_flight_segments = store::read_all(&segments_path).unwrap();
+    assert!(
+        mid_flight_segments.is_empty(),
+        "monitor's later segment must not be flushed while mic's earlier-starting span is still open, got {mid_flight_segments:?}"
+    );
+
+    // Now let mic's monologue actually end.
+    mic_tx.send(pcm_bytes(&mic_trail_samples)).unwrap();
+    drop(mic_tx);
+
+    mic_call.respond(Transcription {
+        text: "mic said something".to_string(),
+        mean_confidence: 0.9,
+    });
+
+    recording.stop().unwrap();
+
+    let segments = store::read_all(&segments_path).unwrap();
+    assert_eq!(segments.len(), 2, "both segments must be persisted");
+    assert!(
+        segments.windows(2).all(|w| w[0].start_ms <= w[1].start_ms),
+        "segments must be ordered by start_ms on disk, not by transcription completion order"
+    );
+    assert_eq!(
+        segments[0].speaker_tag,
+        SpeakerTag::Me,
+        "mic's earlier-starting segment must land first on disk even though monitor transcribed first"
+    );
+    assert_eq!(segments[0].text, "mic said something");
+    assert_eq!(segments[1].speaker_tag, SpeakerTag::Them);
+    assert_eq!(segments[1].text, "monitor said something");
+}

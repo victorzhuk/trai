@@ -1,0 +1,23 @@
+[package]
+name = "trai"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "trai"
+path = "src/main.rs"
+
+[lib]
+name = "trai"
+path = "src/lib.rs"
+
+[dependencies]
+earshot = "1.2.1"
+hound = "3"
+reqwest = { version = "0.12", features = ["blocking", "multipart", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
