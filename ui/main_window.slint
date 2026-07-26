@@ -1,0 +1,54 @@
+import { Button, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+// One row in the transcript panel. The Rust side rebuilds the whole
+// `[TranscriptRow]` model from the Pipeline's live-view snapshot
+// (already sorted by Segment start_ms) and hands it to the window via
+// `set_transcript_rows`, so a late-arriving Segment lands at its
+// timestamp position rather than at the end.
+export struct TranscriptRow {
+    speaker: string,
+    timestamp: string,
+    text: string,
+}
+
+export component AppWindow inherits Window {
+    title: "trai";
+    preferred-width: 600px;
+    preferred-height: 400px;
+
+    in property <[TranscriptRow]> transcript-rows;
+    in property <bool> recording-active: false;
+    in property <string> status-text: "stopped";
+    callback start-clicked();
+    callback stop-clicked();
+
+    VerticalBox {
+        HorizontalBox {
+            Button {
+                text: "Start";
+                enabled: !root.recording-active;
+                clicked => { root.start-clicked(); }
+            }
+            Button {
+                text: "Stop";
+                enabled: root.recording-active;
+                clicked => { root.stop-clicked(); }
+            }
+            Text {
+                text: root.recording-active ? "Recording" : root.status-text;
+            }
+        }
+        ScrollView {
+            VerticalLayout {
+                for row in root.transcript-rows: HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 12px;
+                    Text { text: row.speaker; min-width: 50px; }
+                    Text { text: row.timestamp; min-width: 50px; }
+                    Text { text: row.text; horizontal-stretch: 1; }
+                }
+            }
+        }
+    }
+}

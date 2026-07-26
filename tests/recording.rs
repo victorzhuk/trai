@@ -110,6 +110,7 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
         Cursor::new(pcm_bytes(&monitor_samples)),
         params,
         fake.clone(),
+        |_segments| {},
     )
     .unwrap();
 
@@ -284,6 +285,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
         Cursor::new(pcm_bytes(&monitor_samples)),
         params,
         fake.clone(),
+        |_segments| {},
     )
     .unwrap();
 

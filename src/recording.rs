@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use crate::capture::pw_record;
 use crate::capture::tee_pcm_to_wav;
 use crate::capture::wav_writer::WavWriter;
-use crate::domain::SpeakerTag;
+use crate::domain::{Segment, SpeakerTag};
 use crate::pipeline::{Pipeline, SegmentInput};
 use crate::segmenter::{self, SegmentEvent, Segmenter, SpeechSpan};
 use crate::store::Store;
@@ -35,7 +35,11 @@ pub struct Recording {
 }
 
 impl Recording {
-    pub fn start(params: RecordingParams, transcriber: Arc<dyn Transcriber>) -> io::Result<Self> {
+    pub fn start(
+        params: RecordingParams,
+        transcriber: Arc<dyn Transcriber>,
+        on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         let mut mic_child = pw_record::spawn(&params.mic_source)?;
         let mic_stdout = mic_child
             .stdout
@@ -54,15 +58,20 @@ impl Recording {
             .take()
             .expect("pw-record spawned with piped stdout");
 
-        let mut recording =
-            match Self::start_with_sources(mic_stdout, monitor_stdout, params, transcriber) {
-                Ok(recording) => recording,
-                Err(e) => {
-                    let _ = pw_record::stop(&mut mic_child);
-                    let _ = pw_record::stop(&mut monitor_child);
-                    return Err(e);
-                }
-            };
+        let mut recording = match Self::start_with_sources(
+            mic_stdout,
+            monitor_stdout,
+            params,
+            transcriber,
+            on_transcript_update,
+        ) {
+            Ok(recording) => recording,
+            Err(e) => {
+                let _ = pw_record::stop(&mut mic_child);
+                let _ = pw_record::stop(&mut monitor_child);
+                return Err(e);
+            }
+        };
 
         recording.mic_child = Some(mic_child);
         recording.monitor_child = Some(monitor_child);
@@ -74,6 +83,7 @@ impl Recording {
         monitor_source: R2,
         params: RecordingParams,
         transcriber: Arc<dyn Transcriber>,
+        on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
     ) -> io::Result<Self>
     where
         R1: io::Read + Send + 'static,
@@ -83,6 +93,11 @@ impl Recording {
 
         let store = Store::open(&params.store_dir.join("segments.jsonl"))?;
         let pipeline = Arc::new(Pipeline::new(transcriber, store, params.confidence_floor));
+        // Register the live-view callback before either reader thread
+        // is spawned: a segment can arrive the instant a reader
+        // starts, so the callback must already be in place or early
+        // rows would silently never reach the UI.
+        pipeline.set_on_update(on_transcript_update);
 
         let mic_wav = WavWriter::create(&params.store_dir.join("mic.wav"))?;
         let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))?;
