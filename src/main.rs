@@ -7,9 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use slint::{ModelRc, VecModel};
 
 use trai::config::Config;
-use trai::domain::{Segment, SpeakerTag};
+use trai::domain::Segment;
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
+use trai::transcript::{build_rows, TranscriptRow as UiTranscriptRow};
+use trai::translator::{OpenAITranslator, Translator};
 
 slint::include_modules!();
 
@@ -44,6 +46,10 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_mic_language = config.mic_language.clone();
     let cfg_monitor_language = config.monitor_language.clone();
     let cfg_whisper_url = config.whisper_url.clone();
+    let cfg_translate_base_url = config.translate.base_url.clone();
+    let cfg_translate_model = config.translate.model.clone();
+    let cfg_translate_api_key = config.translate.api_key.clone();
+    let cfg_target_language = config.target_language.clone();
     let cfg_vad_threshold = config.vad_threshold;
     let cfg_silence_hold_ms = config.silence_hold_ms;
     let cfg_duration_cap_ms = config.duration_cap_ms;
@@ -70,18 +76,25 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 confidence_floor: cfg_confidence_floor,
             };
             let transcriber: Arc<dyn Transcriber> = Arc::new(WhisperClient::new(&cfg_whisper_url));
+            let translator: Arc<dyn Translator> = Arc::new(OpenAITranslator::new(
+                &cfg_translate_base_url,
+                &cfg_translate_model,
+                &cfg_target_language,
+                cfg_translate_api_key.clone(),
+            ));
 
             // Marshals each live-view snapshot onto the UI thread.
             // Captures only the Send-safe weak handle; the row model
             // is rebuilt off-thread and handed to invoke_from_event_loop.
             let on_update_weak = window_weak.clone();
             let on_transcript_update = move |segments: Vec<Segment>| {
-                let rows: Vec<TranscriptRow> = segments
-                    .iter()
-                    .map(|s| TranscriptRow {
-                        speaker: speaker_label(s.speaker_tag).into(),
-                        timestamp: format_timestamp(s.start_ms).into(),
-                        text: s.text.clone().into(),
+                let rows: Vec<TranscriptRow> = build_rows(&segments)
+                    .into_iter()
+                    .map(|row: UiTranscriptRow| TranscriptRow {
+                        speaker: row.speaker.into(),
+                        timestamp: row.timestamp.into(),
+                        text: row.text.into(),
+                        translation: row.translation.into(),
                     })
                     .collect();
                 let on_update_weak = on_update_weak.clone();
@@ -92,7 +105,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 });
             };
 
-            match Recording::start(params, transcriber, on_transcript_update) {
+            match Recording::start(params, transcriber, translator, on_transcript_update) {
                 Ok(recording) => {
                     *recording_slot.borrow_mut() = Some(recording);
                     if let Some(w) = window_weak.upgrade() {
@@ -136,18 +149,4 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     }
 
     window.run()
-}
-
-fn speaker_label(tag: SpeakerTag) -> &'static str {
-    match tag {
-        SpeakerTag::Me => "me",
-        SpeakerTag::Them => "them",
-    }
-}
-
-fn format_timestamp(start_ms: u64) -> String {
-    let total_seconds = start_ms / 1000;
-    let minutes = total_seconds / 60;
-    let seconds = total_seconds % 60;
-    format!("{minutes:02}:{seconds:02}")
 }

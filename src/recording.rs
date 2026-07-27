@@ -13,6 +13,7 @@ use crate::pipeline::{Pipeline, SegmentInput};
 use crate::segmenter::{self, SegmentEvent, Segmenter, SpeechSpan};
 use crate::store::Store;
 use crate::transcriber::Transcriber;
+use crate::translator::Translator;
 
 pub struct RecordingParams {
     pub store_dir: PathBuf,
@@ -32,12 +33,14 @@ pub struct Recording {
     mic_reader: JoinHandle<io::Result<()>>,
     monitor_reader: JoinHandle<io::Result<()>>,
     submissions: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    pipeline: Arc<Pipeline>,
 }
 
 impl Recording {
     pub fn start(
         params: RecordingParams,
         transcriber: Arc<dyn Transcriber>,
+        translator: Arc<dyn Translator>,
         on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         let mut mic_child = pw_record::spawn(&params.mic_source)?;
@@ -63,6 +66,7 @@ impl Recording {
             monitor_stdout,
             params,
             transcriber,
+            translator,
             on_transcript_update,
         ) {
             Ok(recording) => recording,
@@ -83,6 +87,7 @@ impl Recording {
         monitor_source: R2,
         params: RecordingParams,
         transcriber: Arc<dyn Transcriber>,
+        translator: Arc<dyn Translator>,
         on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
     ) -> io::Result<Self>
     where
@@ -92,7 +97,12 @@ impl Recording {
         fs::create_dir_all(&params.store_dir)?;
 
         let store = Store::open(&params.store_dir.join("segments.jsonl"))?;
-        let pipeline = Arc::new(Pipeline::new(transcriber, store, params.confidence_floor));
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber,
+            translator,
+            store,
+            params.confidence_floor,
+        ));
         // Register the live-view callback before either reader thread
         // is spawned: a segment can arrive the instant a reader
         // starts, so the callback must already be in place or early
@@ -146,6 +156,7 @@ impl Recording {
             mic_reader,
             monitor_reader,
             submissions,
+            pipeline,
         })
     }
 
@@ -168,6 +179,7 @@ impl Recording {
         for handle in handles {
             handle.join().expect("segment submission thread panicked");
         }
+        self.pipeline.drain_translations();
 
         mic_result?;
         monitor_result?;

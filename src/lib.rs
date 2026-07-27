@@ -8,5 +8,6 @@ pub mod segmenter;
 pub mod store;
 pub mod transcriber;
 pub mod transcript;
+pub mod translator;
 
 pub use domain::{Segment, SpeakerTag};

@@ -7,6 +7,7 @@ use trai::recording::{Recording, RecordingParams};
 use trai::segmenter::{SegmentEvent, Segmenter, SpeechSpan, FRAME_LEN, SAMPLE_RATE_HZ};
 use trai::store;
 use trai::transcriber::{FakeTranscriber, Transcription};
+use trai::translator::FakeTranslator;
 
 const VAD_THRESHOLD: f32 = 0.5;
 const SILENCE_HOLD_MS: u64 = 200;
@@ -89,6 +90,7 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
     let fake = Arc::new(FakeTranscriber::new());
     let mic_call = fake.expect_call(mic_segment_samples);
     let monitor_call = fake.expect_call(monitor_segment_samples);
+    let translator = Arc::new(FakeTranslator::new());
 
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("session");
@@ -110,6 +112,7 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
         Cursor::new(pcm_bytes(&monitor_samples)),
         params,
         fake.clone(),
+        translator,
         |_segments| {},
     )
     .unwrap();
@@ -260,6 +263,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
     let fake = Arc::new(FakeTranscriber::new());
     let mic_call = fake.expect_call(mic_segment_samples);
     let monitor_call = fake.expect_call(monitor_segment_samples);
+    let translator = Arc::new(FakeTranslator::new());
 
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("session");
@@ -285,6 +289,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
         Cursor::new(pcm_bytes(&monitor_samples)),
         params,
         fake.clone(),
+        translator,
         |_segments| {},
     )
     .unwrap();

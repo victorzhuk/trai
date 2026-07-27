@@ -17,6 +17,7 @@ mod tests {
             end_ms: 100,
             text: "hello".to_string(),
             mean_confidence,
+            translation: None,
         }
     }
 

@@ -1,13 +1,15 @@
+use crate::confidence::passes_floor;
+use crate::domain::{Segment, SpeakerTag};
+use crate::store::{Record, Store};
+use crate::transcriber::{TranscribeError, Transcriber};
+use crate::transcript::insert_ordered;
+use crate::translator::Translator;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
-
-use crate::confidence::passes_floor;
-use crate::domain::{Segment, SpeakerTag};
-use crate::store::Store;
-use crate::transcriber::{TranscribeError, Transcriber};
-use crate::transcript::insert_ordered;
+use std::thread::{self, JoinHandle};
 
 pub struct SegmentInput {
     pub speaker_tag: SpeakerTag,
@@ -101,10 +103,29 @@ impl Persisted {
         }
         Ok(())
     }
+
+    fn translation_context(&self, segment_id: u64) -> Vec<String> {
+        let Some(position) = self
+            .live_view
+            .iter()
+            .position(|segment| segment.id == segment_id)
+        else {
+            return Vec::new();
+        };
+
+        let mut context: Vec<String> = self.live_view[..position]
+            .iter()
+            .rev()
+            .filter_map(|segment| segment.translation.clone())
+            .take(3)
+            .collect();
+        context.reverse();
+        context
+    }
 }
 
-// Snapshot callback fired from `finish_pending` with a full, sorted
-// copy of `live_view` each time a Segment passes the confidence floor.
+// Snapshot callback fired with a full, sorted copy of `live_view` each
+// time a Segment passes the confidence floor or gains a translation.
 type TranscriptUpdateCallback = Box<dyn Fn(Vec<Segment>) + Send + Sync>;
 
 /// Turns Segments into transcribed, ordered, persisted ones. Callers
@@ -117,25 +138,36 @@ type TranscriptUpdateCallback = Box<dyn Fn(Vec<Segment>) + Send + Sync>;
 /// transcription never stalls the other.
 pub struct Pipeline {
     transcriber: Arc<dyn Transcriber>,
+    translator: Arc<dyn Translator>,
     confidence_floor: f32,
     next_id: AtomicU64,
-    persisted: Mutex<Persisted>,
-    on_update: Mutex<Option<TranscriptUpdateCallback>>,
+    persisted: Arc<Mutex<Persisted>>,
+    on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+    translation_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    translation_chain_tail: Arc<Mutex<Option<Receiver<()>>>>,
 }
 
 impl Pipeline {
-    pub fn new(transcriber: Arc<dyn Transcriber>, store: Store, confidence_floor: f32) -> Self {
+    pub fn new(
+        transcriber: Arc<dyn Transcriber>,
+        translator: Arc<dyn Translator>,
+        store: Store,
+        confidence_floor: f32,
+    ) -> Self {
         Self {
             transcriber,
+            translator,
             confidence_floor,
             next_id: AtomicU64::new(1),
-            persisted: Mutex::new(Persisted {
+            persisted: Arc::new(Mutex::new(Persisted {
                 transcript: Vec::new(),
                 live_view: Vec::new(),
                 store,
                 in_flight: BTreeMap::new(),
-            }),
-            on_update: Mutex::new(None),
+            })),
+            on_update: Arc::new(Mutex::new(None)),
+            translation_handles: Arc::new(Mutex::new(Vec::new())),
+            translation_chain_tail: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -143,8 +175,8 @@ impl Pipeline {
     /// with a full, sorted snapshot of `live_view` every time a
     /// Segment passes the confidence floor. No-op if never called.
     /// The callback receives `Vec<Segment>` by value and must be
-    /// `Send + Sync` because it is invoked from the submission
-    /// threads, not the UI thread.
+    /// `Send + Sync` because it is invoked from the submission and
+    /// translation threads, not the UI thread.
     pub fn set_on_update(&self, callback: impl Fn(Vec<Segment>) + Send + Sync + 'static) {
         *self.on_update.lock().expect("on_update mutex poisoned") = Some(Box::new(callback));
     }
@@ -170,11 +202,7 @@ impl Pipeline {
             .transcriber
             .transcribe(&input.samples, input.language.as_deref());
 
-        // Clone the live-view snapshot under the lock, run the disk
-        // flush under the lock, then drop the guard before invoking
-        // the user-supplied callback -- the callback may call back
-        // into slint::invoke_from_event_loop and must never run with
-        // the Pipeline's persisted lock held.
+        let mut translation_job = None;
         let snapshot: Option<Vec<Segment>> = {
             let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
             persisted.retire_in_flight(input.start_ms);
@@ -194,12 +222,16 @@ impl Pipeline {
                 end_ms: input.end_ms,
                 text: transcription.text,
                 mean_confidence: transcription.mean_confidence,
+                translation: None,
             };
 
             let mut snapshot = None;
             if passes_floor(&segment, self.confidence_floor) {
+                let segment_id = segment.id;
+                let text = segment.text.clone();
                 insert_ordered(&mut persisted.transcript, segment.clone());
                 insert_ordered(&mut persisted.live_view, segment);
+                translation_job = Some((segment_id, text));
                 snapshot = Some(persisted.live_view.clone());
             }
 
@@ -208,14 +240,11 @@ impl Pipeline {
         };
 
         if let Some(snapshot) = snapshot {
-            if let Some(callback) = self
-                .on_update
-                .lock()
-                .expect("on_update mutex poisoned")
-                .as_ref()
-            {
-                callback(snapshot);
-            }
+            self.fire_update(snapshot);
+        }
+
+        if let Some((segment_id, text)) = translation_job {
+            self.dispatch_translation(segment_id, text);
         }
 
         Ok(())
@@ -228,6 +257,111 @@ impl Pipeline {
         self.begin(input.start_ms);
         self.finish_pending(input)
     }
+
+    pub fn drain_translations(&self) {
+        let handles = std::mem::take(
+            &mut *self
+                .translation_handles
+                .lock()
+                .expect("translation handles mutex poisoned"),
+        );
+        for handle in handles {
+            handle.join().expect("translation thread panicked");
+        }
+    }
+
+    fn dispatch_translation(&self, segment_id: u64, text: String) {
+        let translator = self.translator.clone();
+        let persisted = self.persisted.clone();
+        let on_update = self.on_update.clone();
+
+        let (wait_for_previous, notify_settled) = {
+            let mut chain_tail = self
+                .translation_chain_tail
+                .lock()
+                .expect("translation chain mutex poisoned");
+            (chain_tail.take(), {
+                let (send, recv) = channel();
+                *chain_tail = Some(recv);
+                send
+            })
+        };
+
+        let handle = thread::spawn(move || {
+            if let Some(previous) = wait_for_previous {
+                let _ = previous.recv();
+            }
+
+            let context = {
+                let persisted = persisted.lock().expect("pipeline mutex poisoned");
+                persisted.translation_context(segment_id)
+            };
+
+            match translator.translate(&text, &context) {
+                Ok(translation) => {
+                    if let Err(e) =
+                        Self::record_translation(persisted, on_update, segment_id, translation)
+                    {
+                        eprintln!("translation persist failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("translation failed: {e}");
+                }
+            }
+
+            let _ = notify_settled.send(());
+        });
+
+        self.translation_handles
+            .lock()
+            .expect("translation handles mutex poisoned")
+            .push(handle);
+    }
+
+    fn record_translation(
+        persisted: Arc<Mutex<Persisted>>,
+        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+        segment_id: u64,
+        text: String,
+    ) -> Result<(), PipelineError> {
+        let snapshot = {
+            let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
+            let Some(position) = persisted
+                .live_view
+                .iter()
+                .position(|segment| segment.id == segment_id)
+            else {
+                return Ok(());
+            };
+
+            persisted.store.append_record(&Record::Translation {
+                segment_id,
+                text: text.clone(),
+            })?;
+            persisted.live_view[position].translation = Some(text);
+            Some(persisted.live_view.clone())
+        };
+
+        if let Some(snapshot) = snapshot {
+            if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
+                callback(snapshot);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fire_update(&self, snapshot: Vec<Segment>) {
+        if let Some(callback) = self
+            .on_update
+            .lock()
+            .expect("on_update mutex poisoned")
+            .as_ref()
+        {
+            callback(snapshot);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -235,9 +369,280 @@ mod tests {
     use super::*;
     use crate::domain::SpeakerTag;
     use crate::transcriber::{FakeTranscriber, Transcription};
+    use crate::translator::FakeTranslator;
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn translation_context_uses_last_three_prior_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let store = Store::open(&path).unwrap();
+
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator.clone(),
+            store,
+            0.0,
+        ));
+
+        for id in 1..=5 {
+            submit_and_translate(&pipeline, &transcriber, &translator, id);
+        }
+
+        let calls = translator.recorded_calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0], ("segment 1".to_string(), vec![]));
+        assert_eq!(calls[3].1, vec!["t1", "t2", "t3"]);
+        assert_eq!(calls[4].1, vec!["t2", "t3", "t4"]);
+        assert!(!calls[4].1.iter().any(|text| text == "t1"));
+    }
+    #[test]
+    fn translation_workers_wait_for_previous_to_settle_before_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("transcript.jsonl")).unwrap();
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator.clone(),
+            store,
+            0.0,
+        ));
+
+        let first_samples = vec![1i16; 8];
+        let first_transcribe = transcriber.expect_call(first_samples.clone());
+        let first_translate = translator.expect_call("segment 1".to_string());
+        let first_input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            samples: first_samples,
+            language: None,
+        };
+
+        let pipeline_first = pipeline.clone();
+        let first_handle = thread::spawn(move || pipeline_first.submit(first_input).unwrap());
+        first_transcribe.respond(Transcription {
+            text: "segment 1".to_string(),
+            mean_confidence: 0.95,
+        });
+        first_handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![("segment 1".to_string(), vec![])]
+        );
+
+        let second_samples = vec![2i16; 8];
+        let second_transcribe = transcriber.expect_call(second_samples.clone());
+        let second_translate = translator.expect_call("segment 2".to_string());
+        let second_input = SegmentInput {
+            speaker_tag: SpeakerTag::Them,
+            start_ms: 1_000,
+            end_ms: 1_400,
+            samples: second_samples,
+            language: None,
+        };
+
+        let pipeline_second = pipeline.clone();
+        let second_handle = thread::spawn(move || pipeline_second.submit(second_input).unwrap());
+        second_transcribe.respond(Transcription {
+            text: "segment 2".to_string(),
+            mean_confidence: 0.95,
+        });
+        second_handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![("segment 1".to_string(), vec![])]
+        );
+
+        first_translate.respond("t1".to_string());
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![
+                ("segment 1".to_string(), vec![]),
+                ("segment 2".to_string(), vec!["t1".to_string()])
+            ]
+        );
+
+        second_translate.respond("t2".to_string());
+        pipeline.drain_translations();
+    }
+
+    #[test]
+    fn translation_workers_wait_for_failed_settlement_before_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("transcript.jsonl")).unwrap();
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator.clone(),
+            store,
+            0.0,
+        ));
+
+        let first_samples = vec![1i16; 8];
+        let first_transcribe = transcriber.expect_call(first_samples.clone());
+        let first_translate = translator.expect_call("segment 1".to_string());
+        let first_input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            samples: first_samples,
+            language: None,
+        };
+
+        let pipeline_first = pipeline.clone();
+        let first_handle = thread::spawn(move || pipeline_first.submit(first_input).unwrap());
+        first_transcribe.respond(Transcription {
+            text: "segment 1".to_string(),
+            mean_confidence: 0.95,
+        });
+        first_handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![("segment 1".to_string(), vec![])]
+        );
+
+        let second_samples = vec![2i16; 8];
+        let second_transcribe = transcriber.expect_call(second_samples.clone());
+        let second_translate = translator.expect_call("segment 2".to_string());
+        let second_input = SegmentInput {
+            speaker_tag: SpeakerTag::Them,
+            start_ms: 1_000,
+            end_ms: 1_400,
+            samples: second_samples,
+            language: None,
+        };
+
+        let pipeline_second = pipeline.clone();
+        let second_handle = thread::spawn(move || pipeline_second.submit(second_input).unwrap());
+        second_transcribe.respond(Transcription {
+            text: "segment 2".to_string(),
+            mean_confidence: 0.95,
+        });
+        second_handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![("segment 1".to_string(), vec![])]
+        );
+
+        first_translate.fail(crate::translator::TranslateError::new("forced failure"));
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            translator.recorded_calls(),
+            vec![
+                ("segment 1".to_string(), vec![]),
+                ("segment 2".to_string(), vec![])
+            ]
+        );
+
+        second_translate.respond("t2".to_string());
+        pipeline.drain_translations();
+
+        let live_view = pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .live_view
+            .clone();
+        assert_eq!(live_view[0].translation, None);
+        assert!(live_view[0].text == "segment 1");
+    }
+
+    #[test]
+    fn record_translation_unknown_segment_id_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let store = Store::open(&path).unwrap();
+
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(transcriber, translator, store, 0.0));
+
+        let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_cb = snapshots.clone();
+        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |snapshot: Vec<Segment>| {
+                snapshots_for_cb.lock().unwrap().push(snapshot);
+            }))));
+
+        Pipeline::record_translation(
+            pipeline.persisted.clone(),
+            on_update.clone(),
+            123,
+            "ignored".to_string(),
+        )
+        .unwrap();
+
+        assert!(snapshots.lock().unwrap().is_empty());
+        assert!(fs::read_to_string(path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_translation_leaves_live_view_pending_when_append_fails() {
+        let store = Store::open(Path::new("/dev/full")).unwrap();
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(transcriber, translator, store, 0.0));
+
+        pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .live_view
+            .push(Segment {
+                id: 1,
+                speaker_tag: SpeakerTag::Me,
+                start_ms: 0,
+                end_ms: 400,
+                text: "segment 1".to_string(),
+                mean_confidence: 0.95,
+                translation: None,
+            });
+
+        let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_cb = snapshots.clone();
+        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |snapshot: Vec<Segment>| {
+                snapshots_for_cb.lock().unwrap().push(snapshot);
+            }))));
+
+        let err = Pipeline::record_translation(
+            pipeline.persisted.clone(),
+            on_update,
+            1,
+            "t1".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("store append failed"));
+        assert_eq!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .live_view[0]
+                .translation,
+            None
+        );
+        assert!(snapshots.lock().unwrap().is_empty());
+    }
 
     // The live-view feed delivered to `set_on_update` must stay sorted
     // by start_ms at every callback even when segments complete out of
@@ -250,7 +655,8 @@ mod tests {
         let store = Store::open(&path).unwrap();
 
         let fake = Arc::new(FakeTranscriber::new());
-        let pipeline = Arc::new(Pipeline::new(fake.clone(), store, 0.0));
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(fake.clone(), translator, store, 0.0));
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
         let snapshots_for_cb = snapshots.clone();
@@ -332,5 +738,80 @@ mod tests {
         assert_eq!(final_snap[0].text, "earlier reply, arrives last");
         assert_eq!(final_snap[1].start_ms, 1_000);
         assert_eq!(final_snap[1].text, "later reply, arrives first");
+    }
+    #[test]
+    fn segment_below_confidence_floor_is_not_translated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let store = Store::open(&path).unwrap();
+
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator.clone(),
+            store,
+            0.6,
+        ));
+
+        let samples = vec![9i16; 8];
+        let transcribe_call = transcriber.expect_call(samples.clone());
+        let input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            samples,
+            language: None,
+        };
+
+        let pipeline_for_thread = pipeline.clone();
+        let handle = thread::spawn(move || pipeline_for_thread.submit(input).unwrap());
+        transcribe_call.respond(Transcription {
+            text: "quiet segment".to_string(),
+            mean_confidence: 0.4,
+        });
+        handle.join().unwrap();
+        pipeline.drain_translations();
+
+        assert_eq!(translator.recorded_calls(), vec![]);
+        assert_eq!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .live_view,
+            Vec::new()
+        );
+        assert_eq!(crate::store::read_all(&path).unwrap(), vec![]);
+    }
+
+    fn submit_and_translate(
+        pipeline: &Arc<Pipeline>,
+        transcriber: &Arc<FakeTranscriber>,
+        translator: &Arc<FakeTranslator>,
+        id: u64,
+    ) {
+        let samples = vec![id as i16; 8];
+        let transcribe_call = transcriber.expect_call(samples.clone());
+        let translate_call = translator.expect_call(format!("segment {id}"));
+
+        let input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: id * 1_000,
+            end_ms: id * 1_000 + 400,
+            samples,
+            language: None,
+        };
+
+        let pipeline_for_thread = pipeline.clone();
+        let handle = thread::spawn(move || pipeline_for_thread.submit(input).unwrap());
+
+        transcribe_call.respond(Transcription {
+            text: format!("segment {id}"),
+            mean_confidence: 0.95,
+        });
+        handle.join().unwrap();
+        translate_call.respond(format!("t{id}"));
+        pipeline.drain_translations();
     }
 }

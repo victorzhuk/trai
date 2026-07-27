@@ -5,6 +5,7 @@ use trai::domain::SpeakerTag;
 use trai::pipeline::{Pipeline, SegmentInput};
 use trai::store::{self, Store};
 use trai::transcriber::{FakeTranscriber, Transcription};
+use trai::translator::FakeTranslator;
 
 #[test]
 fn transcript_lands_in_start_ms_order_even_when_the_later_segment_replies_first() {
@@ -13,7 +14,8 @@ fn transcript_lands_in_start_ms_order_even_when_the_later_segment_replies_first(
     let store = Store::open(&path).unwrap();
 
     let fake = Arc::new(FakeTranscriber::new());
-    let pipeline = Arc::new(Pipeline::new(fake.clone(), store, 0.0));
+    let translator = Arc::new(FakeTranslator::new());
+    let pipeline = Arc::new(Pipeline::new(fake.clone(), translator, store, 0.0));
 
     let earlier_samples = vec![11i16; 8];
     let later_samples = vec![22i16; 8];
