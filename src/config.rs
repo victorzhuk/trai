@@ -177,13 +177,9 @@ fn parse_translate_config(raw: RawTranslateConfig) -> Result<TranslateConfig, Co
             ));
         }
 
-        let api_key = raw_backend.api_key.and_then(|api_key| {
-            if api_key.trim().is_empty() {
-                None
-            } else {
-                Some(api_key)
-            }
-        });
+        let api_key = raw_backend
+            .api_key
+            .filter(|api_key| !api_key.trim().is_empty());
 
         backends.push(TranslateBackendConfig {
             base_url,

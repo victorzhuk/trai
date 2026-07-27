@@ -74,7 +74,7 @@ pub fn list_recordings(store_root: &Path) -> io::Result<Vec<RecordingEntry>> {
         });
     }
 
-    entries.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.start_time));
     Ok(entries)
 }
 

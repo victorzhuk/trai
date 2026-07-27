@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-27
+
+### Fixed
+
+- Fix two clippy lints that failed CI on Rust 1.97: `manual_filter` in
+  `config.rs` (use `Option::filter` instead of `and_then` with a conditional)
+  and `unnecessary_sort_by` in `history.rs` (use `sort_by_key` with `Reverse`).
+
 ## [0.1.0] - 2026-07-27
 
 First usable release. Dual-stream meeting transcription and translation with
