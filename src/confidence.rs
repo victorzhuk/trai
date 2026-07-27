@@ -18,6 +18,8 @@ mod tests {
             text: "hello".to_string(),
             mean_confidence,
             translation: None,
+            degraded: false,
+            translation_error: None,
         }
     }
 

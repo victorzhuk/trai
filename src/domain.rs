@@ -17,4 +17,8 @@ pub struct Segment {
     pub mean_confidence: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub translation: Option<String>,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(skip)]
+    pub translation_error: Option<String>,
 }

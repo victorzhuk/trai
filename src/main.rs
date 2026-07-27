@@ -2,16 +2,16 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use slint::{ModelRc, VecModel};
 
-use trai::config::Config;
+use trai::config::{Config, TranslateBackendConfig};
 use trai::domain::Segment;
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
 use trai::transcript::{build_rows, TranscriptRow as UiTranscriptRow};
-use trai::translator::{OpenAITranslator, Translator};
+use trai::translator::{FallbackTranslator, OpenAITranslator, Translator};
 
 slint::include_modules!();
 
@@ -46,9 +46,10 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_mic_language = config.mic_language.clone();
     let cfg_monitor_language = config.monitor_language.clone();
     let cfg_whisper_url = config.whisper_url.clone();
-    let cfg_translate_base_url = config.translate.base_url.clone();
-    let cfg_translate_model = config.translate.model.clone();
-    let cfg_translate_api_key = config.translate.api_key.clone();
+    let cfg_translate_backends = config.translate.backends.clone();
+    let cfg_translate_request_timeout = Duration::from_millis(config.translate.request_timeout_ms);
+    let cfg_translate_reprobe_interval =
+        Duration::from_millis(config.translate.reprobe_interval_ms);
     let cfg_target_language = config.target_language.clone();
     let cfg_vad_threshold = config.vad_threshold;
     let cfg_silence_hold_ms = config.silence_hold_ms;
@@ -76,11 +77,21 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 confidence_floor: cfg_confidence_floor,
             };
             let transcriber: Arc<dyn Transcriber> = Arc::new(WhisperClient::new(&cfg_whisper_url));
-            let translator: Arc<dyn Translator> = Arc::new(OpenAITranslator::new(
-                &cfg_translate_base_url,
-                &cfg_translate_model,
-                &cfg_target_language,
-                cfg_translate_api_key.clone(),
+            let translate_backends: Vec<Arc<dyn Translator>> = cfg_translate_backends
+                .iter()
+                .map(|backend: &TranslateBackendConfig| {
+                    Arc::new(OpenAITranslator::new(
+                        &backend.base_url,
+                        &backend.model,
+                        &cfg_target_language,
+                        backend.api_key.clone(),
+                        cfg_translate_request_timeout,
+                    )) as Arc<dyn Translator>
+                })
+                .collect();
+            let translator: Arc<dyn Translator> = Arc::new(FallbackTranslator::new(
+                translate_backends,
+                cfg_translate_reprobe_interval,
             ));
 
             // Marshals each live-view snapshot onto the UI thread.
@@ -95,6 +106,8 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                         timestamp: row.timestamp.into(),
                         text: row.text.into(),
                         translation: row.translation.into(),
+                        degraded: row.degraded,
+                        error: row.error,
                     })
                     .collect();
                 let on_update_weak = on_update_weak.clone();

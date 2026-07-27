@@ -21,6 +21,13 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct TranslateConfig {
+    pub backends: Vec<TranslateBackendConfig>,
+    pub request_timeout_ms: u64,
+    pub reprobe_interval_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslateBackendConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -94,9 +101,100 @@ struct RawConfig {
 
 #[derive(Deserialize)]
 struct RawTranslateConfig {
+    request_timeout_ms: Option<u64>,
+    reprobe_interval_ms: Option<u64>,
+    backends: Option<Vec<RawTranslateBackend>>,
+}
+
+#[derive(Deserialize)]
+struct RawTranslateBackend {
     base_url: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
+}
+
+fn parse_translate_config(raw: RawTranslateConfig) -> Result<TranslateConfig, ConfigError> {
+    let request_timeout_ms = raw
+        .request_timeout_ms
+        .ok_or(ConfigError::Missing("translate.request_timeout_ms"))?;
+    if request_timeout_ms == 0 {
+        return Err(invalid(
+            "translate.request_timeout_ms",
+            "must be greater than 0",
+        ));
+    }
+
+    let reprobe_interval_ms = raw
+        .reprobe_interval_ms
+        .ok_or(ConfigError::Missing("translate.reprobe_interval_ms"))?;
+    if reprobe_interval_ms == 0 {
+        return Err(invalid(
+            "translate.reprobe_interval_ms",
+            "must be greater than 0",
+        ));
+    }
+
+    let raw_backends = raw
+        .backends
+        .ok_or(ConfigError::Missing("translate.backends"))?;
+    if raw_backends.is_empty() {
+        return Err(invalid("translate.backends", "must not be empty"));
+    }
+
+    let mut backends = Vec::with_capacity(raw_backends.len());
+    for (i, raw_backend) in raw_backends.into_iter().enumerate() {
+        let base_url = raw_backend.base_url.ok_or_else(|| {
+            invalid(
+                "translate.backends",
+                format!("entry {i}: base_url is required"),
+            )
+        })?;
+        if base_url.trim().is_empty() {
+            return Err(invalid(
+                "translate.backends",
+                format!("entry {i}: base_url must not be blank"),
+            ));
+        }
+        reqwest::Url::parse(&base_url).map_err(|e| {
+            invalid(
+                "translate.backends",
+                format!("entry {i}: base_url is not a valid URL: {e}"),
+            )
+        })?;
+
+        let model = raw_backend.model.ok_or_else(|| {
+            invalid(
+                "translate.backends",
+                format!("entry {i}: model is required"),
+            )
+        })?;
+        if model.trim().is_empty() {
+            return Err(invalid(
+                "translate.backends",
+                format!("entry {i}: model must not be blank"),
+            ));
+        }
+
+        let api_key = raw_backend.api_key.and_then(|api_key| {
+            if api_key.trim().is_empty() {
+                None
+            } else {
+                Some(api_key)
+            }
+        });
+
+        backends.push(TranslateBackendConfig {
+            base_url,
+            model,
+            api_key,
+        });
+    }
+
+    Ok(TranslateConfig {
+        backends,
+        request_timeout_ms,
+        reprobe_interval_ms,
+    })
 }
 
 impl Config {
@@ -119,26 +217,8 @@ impl Config {
             raw.target_language
                 .ok_or(ConfigError::Missing("target_language"))?,
         )?;
-        let translate = raw.translate.ok_or(ConfigError::Missing("translate"))?;
-        let translate_base_url = require_non_blank(
-            "translate.base_url",
-            translate
-                .base_url
-                .ok_or(ConfigError::Missing("translate.base_url"))?,
-        )?;
-        let translate_model = require_non_blank(
-            "translate.model",
-            translate
-                .model
-                .ok_or(ConfigError::Missing("translate.model"))?,
-        )?;
-        let translate_api_key = translate.api_key.and_then(|api_key| {
-            if api_key.trim().is_empty() {
-                None
-            } else {
-                Some(api_key)
-            }
-        });
+        let translate =
+            parse_translate_config(raw.translate.ok_or(ConfigError::Missing("translate"))?)?;
         let vad_threshold = raw
             .vad_threshold
             .ok_or(ConfigError::Missing("vad_threshold"))?;
@@ -154,8 +234,6 @@ impl Config {
 
         reqwest::Url::parse(&whisper_url)
             .map_err(|e| invalid("whisper_url", format!("not a valid URL: {e}")))?;
-        reqwest::Url::parse(&translate_base_url)
-            .map_err(|e| invalid("translate.base_url", format!("not a valid URL: {e}")))?;
 
         if !(0.0..=1.0).contains(&confidence_floor) {
             return Err(invalid("confidence_floor", "must be within [0.0, 1.0]"));
@@ -178,11 +256,7 @@ impl Config {
             monitor_language: raw.monitor_language,
             whisper_url,
             target_language,
-            translate: TranslateConfig {
-                base_url: translate_base_url,
-                model: translate_model,
-                api_key: translate_api_key,
-            },
+            translate,
             vad_threshold,
             silence_hold_ms,
             duration_cap_ms,
@@ -210,6 +284,10 @@ mod tests {
             confidence_floor = 0.6
 
             [translate]
+            request_timeout_ms = 8000
+            reprobe_interval_ms = 30000
+
+            [[translate.backends]]
             base_url = "http://localhost:11434"
             model = "gpt-4o-mini"
             api_key = "not-a-secret"
@@ -228,17 +306,63 @@ mod tests {
         assert_eq!(config.monitor_language, Some("de".to_string()));
         assert_eq!(config.whisper_url, "http://localhost:8080");
         assert_eq!(config.target_language, "en");
-        assert_eq!(config.translate.base_url, "http://localhost:11434");
-        assert_eq!(config.translate.model, "gpt-4o-mini");
-        assert_eq!(config.translate.api_key.as_deref(), Some("not-a-secret"));
+        assert_eq!(config.translate.request_timeout_ms, 8000);
+        assert_eq!(config.translate.reprobe_interval_ms, 30000);
+        assert_eq!(config.translate.backends.len(), 1);
+        assert_eq!(
+            config.translate.backends[0].base_url,
+            "http://localhost:11434"
+        );
+        assert_eq!(config.translate.backends[0].model, "gpt-4o-mini");
+        assert_eq!(
+            config.translate.backends[0].api_key.as_deref(),
+            Some("not-a-secret")
+        );
     }
 
     #[test]
-    fn blank_translate_api_key_is_none() {
+    fn two_backends_round_trip_preserving_order() {
+        let toml = valid_toml().replace(
+            r#"[[translate.backends]]
+            base_url = "http://localhost:11434"
+            model = "gpt-4o-mini"
+            api_key = "not-a-secret""#,
+            r#"[[translate.backends]]
+            base_url = "http://lan-host:1234"
+            model = "primary-model"
+
+            [[translate.backends]]
+            base_url = "http://localhost:11434"
+            model = "fallback-model"
+            api_key = "not-a-secret""#,
+        );
+
+        let config = Config::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.translate.backends.len(), 2);
+        assert_eq!(
+            config.translate.backends[0].base_url,
+            "http://lan-host:1234"
+        );
+        assert_eq!(config.translate.backends[0].model, "primary-model");
+        assert_eq!(config.translate.backends[0].api_key, None);
+        assert_eq!(
+            config.translate.backends[1].base_url,
+            "http://localhost:11434"
+        );
+        assert_eq!(config.translate.backends[1].model, "fallback-model");
+        assert_eq!(
+            config.translate.backends[1].api_key.as_deref(),
+            Some("not-a-secret")
+        );
+    }
+
+    #[test]
+    fn blank_translate_backend_api_key_is_none() {
         let toml = valid_toml().replace(r#"api_key = "not-a-secret""#, r#"api_key = "   ""#);
         let config = Config::from_toml_str(&toml).unwrap();
 
-        assert_eq!(config.translate.api_key, None);
+        assert_eq!(config.translate.backends[0].api_key, None);
     }
 
     #[test]
@@ -255,6 +379,10 @@ mod tests {
             confidence_floor = 0.6
 
             [translate]
+            request_timeout_ms = 8000
+            reprobe_interval_ms = 30000
+
+            [[translate.backends]]
             base_url = "http://localhost:11434"
             model = "gpt-4o-mini"
         "#;
@@ -263,7 +391,7 @@ mod tests {
 
         assert_eq!(config.mic_language, None);
         assert_eq!(config.monitor_language, None);
-        assert_eq!(config.translate.api_key, None);
+        assert_eq!(config.translate.backends[0].api_key, None);
     }
 
     #[test]
@@ -280,8 +408,8 @@ mod tests {
             "whisper_url",
             "target_language",
             "translate",
-            "translate.base_url",
-            "translate.model",
+            "translate.request_timeout_ms",
+            "translate.reprobe_interval_ms",
             "vad_threshold",
             "silence_hold_ms",
             "duration_cap_ms",
@@ -300,6 +428,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_translate_backends_names_the_key_in_the_error() {
+        let toml = r#"
+            store_root = "/tmp/trai-store"
+            mic_source = "alsa_input.default"
+            monitor_source = "alsa_output.default.monitor"
+            whisper_url = "http://localhost:8080"
+            target_language = "en"
+            vad_threshold = 0.5
+            silence_hold_ms = 500
+            duration_cap_ms = 30000
+            confidence_floor = 0.6
+
+            [translate]
+            request_timeout_ms = 8000
+            reprobe_interval_ms = 30000
+        "#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "missing required config key: translate.backends"
+        );
+    }
+
+    #[test]
+    fn empty_translate_backends_list_is_rejected_naming_the_key() {
+        let toml = r#"
+            store_root = "/tmp/trai-store"
+            mic_source = "alsa_input.default"
+            monitor_source = "alsa_output.default.monitor"
+            whisper_url = "http://localhost:8080"
+            target_language = "en"
+            vad_threshold = 0.5
+            silence_hold_ms = 500
+            duration_cap_ms = 30000
+            confidence_floor = 0.6
+
+            [translate]
+            request_timeout_ms = 8000
+            reprobe_interval_ms = 30000
+            backends = []
+        "#;
+
+        let err = Config::from_toml_str(toml).unwrap_err();
+        assert_eq!(err.to_string(), "translate.backends: must not be empty");
+    }
+
+    #[test]
     fn invalid_whisper_url_names_that_key_in_the_error() {
         let toml = valid_toml().replace(
             r#"whisper_url = "http://localhost:8080""#,
@@ -311,14 +487,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_translate_base_url_names_that_key_in_the_error() {
+    fn invalid_translate_backend_base_url_names_that_key_in_the_error() {
         let toml = valid_toml().replace(
             r#"base_url = "http://localhost:11434""#,
             r#"base_url = "not a url""#,
         );
 
         let err = Config::from_toml_str(&toml).unwrap_err();
-        assert!(err.to_string().contains("translate.base_url"));
+        assert!(err.to_string().contains("translate.backends"));
     }
     #[test]
     fn invalid_target_language_names_that_key_in_the_error() {
@@ -329,22 +505,38 @@ mod tests {
     }
 
     #[test]
-    fn invalid_translate_base_url_names_that_key_in_the_error_when_blank() {
+    fn blank_translate_backend_base_url_names_that_key_in_the_error() {
         let toml = valid_toml().replace(
             r#"base_url = "http://localhost:11434""#,
             r#"base_url = "   ""#,
         );
 
         let err = Config::from_toml_str(&toml).unwrap_err();
-        assert!(err.to_string().contains("translate.base_url"));
+        assert!(err.to_string().contains("translate.backends"));
     }
 
     #[test]
-    fn invalid_translate_model_names_that_key_in_the_error_when_blank() {
+    fn blank_translate_backend_model_names_that_key_in_the_error() {
         let toml = valid_toml().replace(r#"model = "gpt-4o-mini""#, r#"model = "   ""#);
 
         let err = Config::from_toml_str(&toml).unwrap_err();
-        assert!(err.to_string().contains("translate.model"));
+        assert!(err.to_string().contains("translate.backends"));
+    }
+
+    #[test]
+    fn zero_request_timeout_ms_names_that_key_in_the_error() {
+        let toml = valid_toml().replace("request_timeout_ms = 8000", "request_timeout_ms = 0");
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("translate.request_timeout_ms"));
+    }
+
+    #[test]
+    fn zero_reprobe_interval_ms_names_that_key_in_the_error() {
+        let toml = valid_toml().replace("reprobe_interval_ms = 30000", "reprobe_interval_ms = 0");
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("translate.reprobe_interval_ms"));
     }
 
     #[test]

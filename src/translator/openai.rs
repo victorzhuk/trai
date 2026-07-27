@@ -1,12 +1,11 @@
 use std::time::Duration;
 
 use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{TranslateError, Translator};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use super::{TranslateError, Translation, Translator};
 
 pub struct OpenAITranslator {
     base_url: String,
@@ -22,6 +21,7 @@ impl OpenAITranslator {
         model: impl Into<String>,
         target_language: impl Into<String>,
         api_key: Option<String>,
+        request_timeout: Duration,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
@@ -30,7 +30,7 @@ impl OpenAITranslator {
             target_language: target_language.into(),
             api_key,
             client: Client::builder()
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(request_timeout)
                 .build()
                 .expect("failed to build reqwest blocking client for OpenAI"),
         }
@@ -71,8 +71,15 @@ impl OpenAITranslator {
     }
 }
 
+fn classify_status(status: StatusCode) -> fn(String) -> TranslateError {
+    match status.as_u16() {
+        400 | 401 | 403 | 404 => TranslateError::misconfigured,
+        _ => TranslateError::unavailable,
+    }
+}
+
 impl Translator for OpenAITranslator {
-    fn translate(&self, text: &str, context: &[String]) -> Result<String, TranslateError> {
+    fn translate(&self, text: &str, context: &[String]) -> Result<Translation, TranslateError> {
         let body = Self::build_request_payload(&self.model, &self.target_language, context, text);
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -83,27 +90,50 @@ impl Translator for OpenAITranslator {
 
         let response = request
             .send()
-            .map_err(|e| TranslateError::new(format!("translate request failed: {e}")))?;
+            .map_err(|e| TranslateError::unavailable(format!("translate request failed: {e}")))?;
 
-        let response = response.error_for_status().map_err(|e| {
-            let status = e
-                .status()
-                .map_or_else(|| "unknown status".to_string(), |status| status.to_string());
-            TranslateError::new(format!("translate request failed with status: {status}"))
+        let status = response.status();
+        let response = response.error_for_status().map_err(|_| {
+            classify_status(status)(format!("translate request failed with status: {status}"))
         })?;
 
-        let raw_body = response
-            .text()
-            .map_err(|e| TranslateError::new(format!("failed to read translate response: {e}")))?;
+        let raw_body = response.text().map_err(|e| {
+            TranslateError::unavailable(format!("failed to read translate response: {e}"))
+        })?;
 
-        let response: ChatCompletionResponse = serde_json::from_str(&raw_body)
-            .map_err(|e| TranslateError::new(format!("failed to parse translate response: {e}")))?;
+        let response: ChatCompletionResponse = serde_json::from_str(&raw_body).map_err(|e| {
+            TranslateError::unavailable(format!("failed to parse translate response: {e}"))
+        })?;
 
-        response
+        let text = response
             .choices
             .first()
             .and_then(|choice| choice.message.content.clone())
-            .ok_or_else(|| TranslateError::new("translate response missing content"))
+            .ok_or_else(|| TranslateError::unavailable("translate response missing content"))?;
+
+        Ok(Translation {
+            text,
+            degraded: false,
+        })
+    }
+
+    fn probe(&self) -> Result<(), TranslateError> {
+        let url = format!("{}/models", self.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+
+        let response = request
+            .send()
+            .map_err(|e| TranslateError::unavailable(format!("probe request failed: {e}")))?;
+
+        let status = response.status();
+        response.error_for_status().map_err(|_| {
+            classify_status(status)(format!("probe request failed with status: {status}"))
+        })?;
+
+        Ok(())
     }
 }
 
@@ -129,10 +159,9 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    fn serve_translate_response(
-        status_line: &str,
-        response_body: &str,
-    ) -> (OpenAITranslator, thread::JoinHandle<()>) {
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn serve_response(status_line: &str, response_body: &str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let response_body = response_body.to_string();
@@ -155,14 +184,27 @@ Connection: close\r\n\
             stream.write_all(response.as_bytes()).unwrap();
         });
 
-        let translator =
-            OpenAITranslator::new(format!("http://{address}"), "gpt-4o-mini", "es", None);
+        (format!("http://{address}"), server)
+    }
+
+    fn serve_translate_response(
+        status_line: &str,
+        response_body: &str,
+    ) -> (OpenAITranslator, thread::JoinHandle<()>) {
+        let (address, server) = serve_response(status_line, response_body);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
         (translator, server)
     }
 
     #[test]
     fn new_strips_trailing_slashes_from_base_url() {
-        let translator = OpenAITranslator::new("http://example.com///", "gpt-4o-mini", "es", None);
+        let translator = OpenAITranslator::new(
+            "http://example.com///",
+            "gpt-4o-mini",
+            "es",
+            None,
+            TEST_TIMEOUT,
+        );
 
         assert_eq!(translator.base_url, "http://example.com");
     }
@@ -189,17 +231,32 @@ Connection: close\r\n\
     }
 
     #[test]
-    fn translate_non_2xx_response_returns_error() {
+    fn translate_5xx_response_classifies_as_unavailable() {
         let (translator, server) =
             serve_translate_response("HTTP/1.1 500 Internal Server Error", r#"internal error"#);
         let err = translator
             .translate("hello", &[])
             .expect_err("non-2xx response should fail");
 
+        assert!(!err.is_misconfigured());
         assert!(err
             .to_string()
             .contains("translate request failed with status"));
         assert!(err.to_string().contains("500"));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn translate_404_response_classifies_as_misconfigured() {
+        let (translator, server) =
+            serve_translate_response("HTTP/1.1 404 Not Found", r#"not found"#);
+        let err = translator
+            .translate("hello", &[])
+            .expect_err("non-2xx response should fail");
+
+        assert!(err.is_misconfigured());
+        assert!(err.to_string().contains("404"));
 
         server.join().unwrap();
     }
@@ -214,19 +271,42 @@ Connection: close\r\n\
             .translate("hello", &[])
             .expect("translation should succeed");
 
-        assert_eq!(translation, "hola");
+        assert_eq!(translation.text, "hola");
+        assert!(!translation.degraded);
 
         server.join().unwrap();
     }
 
     #[test]
-    fn translate_missing_content_returns_error() {
+    fn translate_missing_content_returns_unavailable_error() {
         let (translator, server) = serve_translate_response("HTTP/1.1 200 OK", r#"{"choices":[]}"#);
         let err = translator
             .translate("hello", &[])
             .expect_err("empty choices should fail");
 
+        assert!(!err.is_misconfigured());
         assert_eq!(err.to_string(), "translate response missing content");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_success_on_2xx() {
+        let (address, server) = serve_response("HTTP/1.1 200 OK", r#"{"data":[]}"#);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
+
+        translator.probe().expect("probe should succeed");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_failure_on_non_2xx_classifies_by_status() {
+        let (address, server) = serve_response("HTTP/1.1 401 Unauthorized", r#"unauthorized"#);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
+
+        let err = translator.probe().expect_err("probe should fail");
+        assert!(err.is_misconfigured());
 
         server.join().unwrap();
     }

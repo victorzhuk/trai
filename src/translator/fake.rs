@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
 
-use super::{TranslateError, Translator};
+use super::{TranslateError, Translation, Translator};
 
-type Outcome = Result<String, TranslateError>;
+type Outcome = Result<Translation, TranslateError>;
+type ProbeOutcome = Result<(), TranslateError>;
 
 type PendingCall = Receiver<Outcome>;
+type PendingProbe = Receiver<ProbeOutcome>;
 
 /// Test-only Translator whose calls block until a test explicitly
 /// releases them, so completion order is decided by the test rather
@@ -14,6 +16,8 @@ type PendingCall = Receiver<Outcome>;
 pub struct FakeTranslator {
     pending: Mutex<HashMap<String, PendingCall>>,
     calls: Mutex<Vec<(String, Vec<String>)>>,
+    pending_probes: Mutex<VecDeque<PendingProbe>>,
+    probe_count: Mutex<usize>,
 }
 
 impl FakeTranslator {
@@ -21,6 +25,8 @@ impl FakeTranslator {
         Self {
             pending: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            pending_probes: Mutex::new(VecDeque::new()),
+            probe_count: Mutex::new(0),
         }
     }
 
@@ -42,6 +48,24 @@ impl FakeTranslator {
             .lock()
             .expect("fake translator mutex poisoned")
             .clone()
+    }
+
+    /// Queues the canned outcome for the next `probe()` call, FIFO.
+    /// `respond` on the returned handle rendezvous with that call.
+    pub fn expect_probe(&self) -> ProbeHandle {
+        let (tx, rx) = sync_channel(0);
+        self.pending_probes
+            .lock()
+            .expect("fake translator mutex poisoned")
+            .push_back(rx);
+        ProbeHandle { tx }
+    }
+
+    pub fn recorded_probes(&self) -> usize {
+        *self
+            .probe_count
+            .lock()
+            .expect("fake translator mutex poisoned")
     }
 }
 
@@ -68,6 +92,23 @@ impl Translator for FakeTranslator {
         rx.recv()
             .map_err(|_| TranslateError::new("call handle dropped before responding"))?
     }
+
+    fn probe(&self) -> ProbeOutcome {
+        *self
+            .probe_count
+            .lock()
+            .expect("fake translator mutex poisoned") += 1;
+
+        let rx = self
+            .pending_probes
+            .lock()
+            .expect("fake translator mutex poisoned")
+            .pop_front()
+            .ok_or_else(|| TranslateError::new("no expectation registered for this probe"))?;
+
+        rx.recv()
+            .map_err(|_| TranslateError::new("probe handle dropped before responding"))?
+    }
 }
 
 pub struct CallHandle {
@@ -76,11 +117,32 @@ pub struct CallHandle {
 
 impl CallHandle {
     pub fn respond(self, translation: String) {
-        let _ = self.tx.send(Ok(translation));
+        let _ = self.tx.send(Ok(Translation {
+            text: translation,
+            degraded: false,
+        }));
     }
 
     pub fn fail(self, error: TranslateError) {
         let _ = self.tx.send(Err(error));
+    }
+}
+
+pub struct ProbeHandle {
+    tx: SyncSender<ProbeOutcome>,
+}
+
+impl ProbeHandle {
+    pub fn succeed(self) {
+        let _ = self.tx.send(Ok(()));
+    }
+
+    pub fn fail(self, error: TranslateError) {
+        let _ = self.tx.send(Err(error));
+    }
+
+    pub fn respond(self, outcome: ProbeOutcome) {
+        let _ = self.tx.send(outcome);
     }
 }
 
@@ -106,6 +168,32 @@ mod tests {
         );
 
         call.respond("hola".to_string());
-        assert_eq!(handle.join().unwrap().unwrap(), "hola");
+        assert_eq!(handle.join().unwrap().unwrap().text, "hola");
+    }
+
+    #[test]
+    fn probe_without_expectation_fails_immediately_instead_of_blocking() {
+        let fake = FakeTranslator::new();
+        let err = fake.probe().expect_err("unexpected probe should fail");
+        assert!(err.to_string().contains("no expectation registered"));
+    }
+
+    #[test]
+    fn probes_are_served_fifo_and_counted() {
+        let fake = Arc::new(FakeTranslator::new());
+        let first = fake.expect_probe();
+        let second = fake.expect_probe();
+
+        let fake_for_first = fake.clone();
+        let first_handle = thread::spawn(move || fake_for_first.probe());
+        first.succeed();
+        assert!(first_handle.join().unwrap().is_ok());
+
+        let fake_for_second = fake.clone();
+        let second_handle = thread::spawn(move || fake_for_second.probe());
+        second.fail(TranslateError::unavailable("down"));
+        assert!(second_handle.join().unwrap().is_err());
+
+        assert_eq!(fake.recorded_probes(), 2);
     }
 }

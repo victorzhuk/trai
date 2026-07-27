@@ -8,7 +8,12 @@ use std::path::Path;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Record {
     Segment(Segment),
-    Translation { segment_id: u64, text: String },
+    Translation {
+        segment_id: u64,
+        text: String,
+        #[serde(default)]
+        degraded: bool,
+    },
 }
 
 pub struct Store {
@@ -44,21 +49,27 @@ pub fn read_all(path: &Path) -> io::Result<Vec<Segment>> {
 
     let mut segments: Vec<Segment> = Vec::with_capacity(lines.len());
     let mut index_by_id: HashMap<u64, usize> = HashMap::new();
-    let mut translations_by_id: HashMap<u64, String> = HashMap::new();
+    let mut translations_by_id: HashMap<u64, (String, bool)> = HashMap::new();
 
     for (i, line) in lines.iter().enumerate() {
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Segment(mut segment)) => {
-                if let Some(text) = translations_by_id.get(&segment.id) {
+                if let Some((text, degraded)) = translations_by_id.get(&segment.id) {
                     segment.translation = Some(text.clone());
+                    segment.degraded = *degraded;
                 }
                 index_by_id.insert(segment.id, segments.len());
                 segments.push(segment);
             }
-            Ok(Record::Translation { segment_id, text }) => {
-                translations_by_id.insert(segment_id, text.clone());
+            Ok(Record::Translation {
+                segment_id,
+                text,
+                degraded,
+            }) => {
+                translations_by_id.insert(segment_id, (text.clone(), degraded));
                 if let Some(index) = index_by_id.get(&segment_id) {
                     segments[*index].translation = Some(text);
+                    segments[*index].degraded = degraded;
                 }
             }
             Err(e) => {
@@ -92,6 +103,8 @@ mod tests {
             text: format!("segment {id}"),
             mean_confidence: 0.8,
             translation: None,
+            degraded: false,
+            translation_error: None,
         }
     }
 
@@ -125,6 +138,7 @@ mod tests {
             .append_record(&Record::Translation {
                 segment_id: 1,
                 text: "hola".to_string(),
+                degraded: false,
             })
             .unwrap();
         store.append(&s2).unwrap();
@@ -132,6 +146,7 @@ mod tests {
             .append_record(&Record::Translation {
                 segment_id: 2,
                 text: "bonjour".to_string(),
+                degraded: false,
             })
             .unwrap();
 
@@ -139,6 +154,69 @@ mod tests {
         assert_eq!(read_back.len(), 2);
         assert_eq!(read_back[0].translation.as_deref(), Some("hola"));
         assert_eq!(read_back[1].translation.as_deref(), Some("bonjour"));
+    }
+
+    #[test]
+    fn degraded_translation_record_merges_into_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let segment = make_segment(1);
+
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&segment).unwrap();
+        store
+            .append_record(&Record::Translation {
+                segment_id: 1,
+                text: "hola".to_string(),
+                degraded: true,
+            })
+            .unwrap();
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].translation.as_deref(), Some("hola"));
+        assert!(read_back[0].degraded);
+    }
+
+    #[test]
+    fn old_format_segment_record_without_degraded_key_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let raw = concat!(
+            r#"{"kind":"segment","id":1,"speaker_tag":"me","start_ms":100,"end_ms":150,"#,
+            r#""text":"segment 1","mean_confidence":0.8}"#,
+            "\n"
+        );
+        fs::write(&path, raw).unwrap();
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].id, 1);
+        assert_eq!(read_back[0].text, "segment 1");
+        assert!(!read_back[0].degraded);
+    }
+
+    #[test]
+    fn old_format_translation_record_without_degraded_key_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let segment = make_segment(1);
+
+        let mut raw = String::new();
+        raw.push_str(&serde_json::to_string(&Record::Segment(segment.clone())).unwrap());
+        raw.push('\n');
+        raw.push_str(r#"{"kind":"translation","segment_id":1,"text":"hola"}"#);
+        raw.push('\n');
+
+        fs::write(&path, raw).unwrap();
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].translation.as_deref(), Some("hola"));
+        assert!(!read_back[0].degraded);
     }
 
     #[test]
@@ -194,6 +272,7 @@ mod tests {
             &serde_json::to_string(&Record::Translation {
                 segment_id: 2,
                 text: "seg2 translation".to_string(),
+                degraded: false,
             })
             .unwrap(),
         );
@@ -202,6 +281,7 @@ mod tests {
             &serde_json::to_string(&Record::Translation {
                 segment_id: 1,
                 text: "seg1 translation".to_string(),
+                degraded: false,
             })
             .unwrap(),
         );

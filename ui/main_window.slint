@@ -3,11 +3,15 @@ import { Button, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slin
 // One row in the transcript panel. The Rust side rebuilds `[TranscriptRow]`
 // from the Pipeline's live-view snapshot on each Segment update, then hands it
 // to `set_transcript_rows` so late updates can replace pending text by index.
+// `degraded` marks a translation served by a fallback backend; `error` marks
+// a misconfigured backend's rejection surfaced in place of a translation.
 export struct TranscriptRow {
     speaker: string,
     timestamp: string,
     text: string,
     translation: string,
+    degraded: bool,
+    error: bool,
 }
 
 export component AppWindow inherits Window {
@@ -46,7 +50,18 @@ export component AppWindow inherits Window {
                     Text { text: row.speaker; min-width: 42px; max-width: 42px; }
                     Text { text: row.timestamp; min-width: 48px; max-width: 48px; }
                     Text { text: row.text; horizontal-stretch: 1; min-width: 0px; }
-                    Text { text: row.translation; horizontal-stretch: 1; min-width: 0px; }
+                    Text {
+                        text: row.error ? "✕" : row.degraded ? "⚠" : "";
+                        min-width: 18px;
+                        max-width: 18px;
+                        color: row.error ? red : row.degraded ? #b45309 : black;
+                    }
+                    Text {
+                        text: row.translation;
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        color: row.error ? red : row.degraded ? #b45309 : black;
+                    }
                 }
             }
         }

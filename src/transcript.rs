@@ -8,19 +8,30 @@ pub struct TranscriptRow {
     pub timestamp: String,
     pub text: String,
     pub translation: String,
+    pub degraded: bool,
+    pub error: bool,
 }
 
 pub fn build_rows(segments: &[Segment]) -> Vec<TranscriptRow> {
     segments
         .iter()
-        .map(|segment| TranscriptRow {
-            speaker: speaker_label(segment.speaker_tag).into(),
-            timestamp: format_timestamp(segment.start_ms),
-            text: segment.text.clone(),
-            translation: segment
-                .translation
-                .clone()
-                .unwrap_or_else(|| PENDING_TRANSLATION.to_string()),
+        .map(|segment| {
+            let (translation, degraded, error) = if let Some(message) = &segment.translation_error {
+                (message.clone(), false, true)
+            } else if let Some(translation) = &segment.translation {
+                (translation.clone(), segment.degraded, false)
+            } else {
+                (PENDING_TRANSLATION.to_string(), false, false)
+            };
+
+            TranscriptRow {
+                speaker: speaker_label(segment.speaker_tag).into(),
+                timestamp: format_timestamp(segment.start_ms),
+                text: segment.text.clone(),
+                translation,
+                degraded,
+                error,
+            }
         })
         .collect()
 }
@@ -63,6 +74,8 @@ mod tests {
             text: format!("segment-{id}"),
             mean_confidence: 0.9,
             translation: translation.map(String::from),
+            degraded: false,
+            translation_error: None,
         }
     }
 
@@ -121,7 +134,51 @@ mod tests {
         assert_eq!(rows[0].speaker, "me");
         assert_eq!(rows[0].timestamp, "00:00");
         assert_eq!(rows[0].translation, "…");
+        assert!(!rows[0].degraded);
+        assert!(!rows[0].error);
         assert_eq!(rows[1].translation, "bonjour");
+        assert!(!rows[1].degraded);
+        assert!(!rows[1].error);
+    }
+
+    #[test]
+    fn build_rows_marks_degraded_segment_and_leaves_other_fields_untouched() {
+        let normal = make_segment(1, SpeakerTag::Me, 0, Some("bonjour"));
+        let degraded = Segment {
+            degraded: true,
+            ..normal.clone()
+        };
+
+        let normal_rows = build_rows(&[normal]);
+        let degraded_rows = build_rows(&[degraded]);
+
+        assert_eq!(degraded_rows[0].translation, "bonjour");
+        assert!(degraded_rows[0].degraded);
+        assert!(!degraded_rows[0].error);
+
+        assert_eq!(normal_rows[0].speaker, degraded_rows[0].speaker);
+        assert_eq!(normal_rows[0].timestamp, degraded_rows[0].timestamp);
+        assert_eq!(normal_rows[0].text, degraded_rows[0].text);
+    }
+
+    #[test]
+    fn build_rows_surfaces_translation_error_and_leaves_other_fields_untouched() {
+        let normal = make_segment(1, SpeakerTag::Me, 0, None);
+        let errored = Segment {
+            translation_error: Some("model 'x' not found".to_string()),
+            ..normal.clone()
+        };
+
+        let normal_rows = build_rows(&[normal]);
+        let error_rows = build_rows(&[errored]);
+
+        assert_eq!(error_rows[0].translation, "model 'x' not found");
+        assert!(error_rows[0].error);
+        assert!(!error_rows[0].degraded);
+
+        assert_eq!(normal_rows[0].speaker, error_rows[0].speaker);
+        assert_eq!(normal_rows[0].timestamp, error_rows[0].timestamp);
+        assert_eq!(normal_rows[0].text, error_rows[0].text);
     }
 
     #[test]
