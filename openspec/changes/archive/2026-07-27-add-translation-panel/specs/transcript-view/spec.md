@@ -30,9 +30,9 @@ When a Segment closes, both panels SHALL receive a row at the same index. The tr
 
 ### Requirement: Locked scrolling between panels
 
-The two panels SHALL scroll together so that a row and its translation stay side by side.
+The translation column SHALL share the original panel's scrolling container, so a row and its translation scroll as one and can never drift apart.
 
-#### Scenario: User scrolls one panel
+#### Scenario: User scrolls the transcript view
 
-- **WHEN** the user scrolls either panel
-- **THEN** the other panel moves to show the same rows
+- **WHEN** the user scrolls the transcript view
+- **THEN** the original and translation columns move together, keeping each row beside its translation

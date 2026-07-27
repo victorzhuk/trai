@@ -1,19 +1,19 @@
 ## 1. Translation core, test-first
 
-- [ ] 1.1 Define the `Translator` trait and a fake whose latency and failure are controllable. Acceptance: tests can hold a translation open indefinitely.
-- [ ] 1.2 Failing test: translating a Segment sends its text plus the previous three translated lines as context, and no more than three. Acceptance: the fourth-oldest line is absent from the request.
-- [ ] 1.3 Implement the rolling context window until 1.2 passes.
-- [ ] 1.4 Failing test: a translation record appended after its Segment merges on read into one line carrying both texts. Acceptance: reading a file where the translation record is missing yields the Segment with no translation rather than an error.
-- [ ] 1.5 Implement the two-record transcript format and its merge on read until 1.4 passes.
+- [x] 1.1 Define the `Translator` trait and a fake whose latency and failure are controllable. Acceptance: tests can hold a translation open indefinitely.
+- [x] 1.2 Failing test: translating a Segment sends its text plus the previous three translated lines as context, and no more than three. Acceptance: the fourth-oldest line is absent from the request.
+- [x] 1.3 Implement the rolling context window until 1.2 passes.
+- [x] 1.4 Failing test: a translation record appended after its Segment merges on read into one line carrying both texts. Acceptance: reading a file where the translation record is missing yields the Segment with no translation rather than an error.
+- [x] 1.5 Implement the two-record transcript format and its merge on read until 1.4 passes.
 
 ## 2. Translate backend client
 
-- [ ] 2.1 Implement an OpenAI-compatible chat client behind the `Translator` trait, taking base URL, model and optional API key from configuration. Acceptance: the target language comes from config and appears in the request.
+- [x] 2.1 Implement an OpenAI-compatible chat client behind the `Translator` trait, taking base URL, model and optional API key from configuration. Acceptance: the target language comes from config and appears in the request.
 - [ ] 2.2 Verify against the configured backend that a Russian and an English Segment each return a usable translation. Acceptance: recorded in the change before marking done.
 
 ## 3. Configuration
 
-- [ ] 3.1 Extend the TOML file with the target language and the translate backend definition. Acceptance: startup validation names a missing target language rather than translating into nothing.
+- [x] 3.1 Extend the TOML file with the target language and the translate backend definition. Acceptance: startup validation names a missing target language rather than translating into nothing.
 
 ## 4. Second panel, tests after
 

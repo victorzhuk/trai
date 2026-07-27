@@ -1,5 +1,8 @@
-## ADDED Requirements
+# translation Specification
 
+## Purpose
+TBD - created by archiving change add-translation-panel. Update Purpose after archive.
+## Requirements
 ### Requirement: Segment translation into the configured target language
 
 Every Segment that enters the transcript SHALL be translated into the single target language taken from configuration, by sending one request per Segment to an OpenAI-compatible chat endpoint. The target language SHALL NOT be selectable per Recording.
@@ -18,9 +21,9 @@ Every Segment that enters the transcript SHALL be translated into the single tar
 
 A translation request SHALL carry the Segment's own text together with the previous three translated lines of the same Recording as context, and no more.
 
-#### Scenario: Fourth line of a Recording is translated
+#### Scenario: Fifth line of a Recording is translated
 
-- **WHEN** the fourth Segment of a Recording is translated
+- **WHEN** the fifth Segment of a Recording is translated
 - **THEN** the request carries the three preceding translated lines and does not carry the first line
 
 #### Scenario: First line of a Recording is translated
@@ -41,3 +44,4 @@ A completed translation SHALL be appended to the Recording's transcript file as 
 
 - **WHEN** a transcript is read in which one Segment has no translation record
 - **THEN** that Segment is returned with its original text and no translation, and the remaining Segments are unaffected
+
