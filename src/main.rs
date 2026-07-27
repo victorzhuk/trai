@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use slint::{Model, ModelRc, VecModel};
@@ -10,14 +10,17 @@ use trai::capture::source_list::{enumerate, resolve_defaults, SourceKind};
 use trai::config::{Config, TranslateBackendConfig};
 use trai::domain::Segment;
 use trai::history;
+use trai::pipeline::Pipeline;
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
-use trai::transcript::{build_rows, TranscriptRow as UiTranscriptRow};
+use trai::transcript::{build_rows, summarize, TranscriptRow as UiTranscriptRow};
 use trai::translator::{FallbackTranslator, OpenAITranslator, Translator};
 
 slint::include_modules!();
 
 fn main() {
+    trai::log::init();
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
@@ -60,21 +63,32 @@ fn format_timestamp(secs: u64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hour, minute)
 }
 
+fn to_ui_rows(segments: &[Segment], target_language: &str) -> Vec<TranscriptRow> {
+    build_rows(segments, target_language)
+        .into_iter()
+        .map(|row: UiTranscriptRow| TranscriptRow {
+            speaker: row.speaker.into(),
+            mine: row.mine,
+            timestamp: row.timestamp.into(),
+            text: row.text.into(),
+            translation: row.translation.into(),
+            transcribing: row.transcribing,
+            text_failed: row.text_failed,
+            pending: row.pending,
+            verbatim: row.verbatim,
+            degraded: row.degraded,
+            error: row.error,
+        })
+        .collect()
+}
+
 fn make_transcript_updater(
     window_weak: slint::Weak<AppWindow>,
+    target_language: String,
 ) -> impl Fn(Vec<Segment>) + Send + Sync + 'static {
     move |segments: Vec<Segment>| {
-        let rows: Vec<TranscriptRow> = build_rows(&segments)
-            .into_iter()
-            .map(|row: UiTranscriptRow| TranscriptRow {
-                speaker: row.speaker.into(),
-                timestamp: row.timestamp.into(),
-                text: row.text.into(),
-                translation: row.translation.into(),
-                degraded: row.degraded,
-                error: row.error,
-            })
-            .collect();
+        let rows = to_ui_rows(&segments, &target_language);
+        let status = summarize(&segments, &target_language);
         let window_weak = window_weak.clone();
         // Marshals each live-view snapshot onto the UI thread.
         // Captures only the Send-safe weak handle; the row model
@@ -82,6 +96,12 @@ fn make_transcript_updater(
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(w) = window_weak.upgrade() {
                 w.set_transcript_rows(ModelRc::new(VecModel::from(rows)));
+                w.set_pending_transcriptions(status.transcribing as i32);
+                w.set_pending_translations(status.translating as i32);
+                w.set_failed_transcriptions(status.failed as i32);
+                w.set_mic_language(status.mic_language.unwrap_or_default().into());
+                w.set_monitor_language(status.monitor_language.unwrap_or_default().into());
+                w.set_translation_degraded(status.degraded);
             }
         });
     }
@@ -127,6 +147,11 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
 
     let recording: Rc<RefCell<Option<Recording>>> = Rc::new(RefCell::new(None));
+    // The active recording's Pipeline, kept so the force-stop button
+    // can signal it while stop() is draining in a background thread.
+    // Arc<Mutex> (not Rc<RefCell>) because the stop-completion callback
+    // runs via invoke_from_event_loop which requires Send.
+    let force_stop_pipeline: Arc<Mutex<Option<Arc<Pipeline>>>> = Arc::new(Mutex::new(None));
     // Dir of the recording currently open in the replay view, so the
     // delete handler can wipe it without re-resolving from the index.
     let replay_target: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
@@ -147,6 +172,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_vad_threshold = config.vad_threshold;
     let cfg_silence_hold_ms = config.silence_hold_ms;
     let cfg_duration_cap_ms = config.duration_cap_ms;
+    let cfg_live_chunk_ms = config.live_chunk_ms;
     let cfg_confidence_floor = config.confidence_floor;
 
     {
@@ -288,6 +314,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 vad_threshold: cfg_vad_threshold,
                 silence_hold_ms: cfg_silence_hold_ms,
                 duration_cap_ms: cfg_duration_cap_ms,
+                live_chunk_ms: cfg_live_chunk_ms,
                 confidence_floor: cfg_confidence_floor,
             };
 
@@ -309,7 +336,8 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 cfg_translate_reprobe_interval,
             ));
 
-            let on_transcript_update = make_transcript_updater(window_weak.clone());
+            let on_transcript_update =
+                make_transcript_updater(window_weak.clone(), cfg_target_language.clone());
 
             match Recording::start(params, transcriber, translator, on_transcript_update) {
                 Ok(recording) => {
@@ -338,29 +366,47 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
 
     {
         let recording_slot = recording.clone();
+        let force_stop_pipeline_slot = force_stop_pipeline.clone();
         let window_weak = window.as_weak();
         let cfg_store_root = cfg_store_root.clone();
         window.on_stop_clicked(move || {
             let Some(recording) = recording_slot.borrow_mut().take() else {
                 return;
             };
+            // Keep a handle to the Pipeline so the force-stop button
+            // can signal it while stop() drains in the background.
+            let pipeline = recording.pipeline().clone();
+            *force_stop_pipeline_slot.lock().unwrap() = Some(pipeline);
+
             // stop() joins both reader threads and every outstanding
             // submission thread, so it can block for the tail of an
-            // in-flight transcription; run it off the UI thread and
-            // flip the active flag back from the event loop. Refresh
-            // the history list in the same callback so the recording
-            // that just stopped lands at the top of the list.
+            // in-flight transcription. Flip the controls before that
+            // drain rather than after it, or the button stays lit for
+            // as long as the last transcription takes. `stopping` keeps
+            // the transcript on screen meanwhile, since late Segments
+            // still arrive during the drain.
+            if let Some(w) = window_weak.upgrade() {
+                w.set_recording_active(false);
+                w.set_stopping(true);
+            }
+
             let window_weak = window_weak.clone();
             let cfg_store_root = cfg_store_root.clone();
+            let force_stop_pipeline_slot = force_stop_pipeline_slot.clone();
             std::thread::spawn(move || {
                 if let Err(e) = recording.stop() {
                     eprintln!("recording stop failed: {e}");
                 }
+                // Refresh the history list in the same callback so the
+                // recording that just stopped lands at the top of it.
                 let window_weak = window_weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = window_weak.upgrade() {
-                        w.set_recording_active(false);
+                        w.set_stopping(false);
                     }
+                    // The Pipeline is no longer draining, so drop the
+                    // force-stop handle.
+                    *force_stop_pipeline_slot.lock().unwrap() = None;
                     refresh_history_rows(&cfg_store_root, window_weak);
                 });
             });
@@ -368,9 +414,19 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     }
 
     {
+        let force_stop_pipeline_slot = force_stop_pipeline.clone();
+        window.on_force_stop_clicked(move || {
+            if let Some(p) = force_stop_pipeline_slot.lock().unwrap().as_ref() {
+                p.signal_force_stop();
+            }
+        });
+    }
+
+    {
         let replay_target = replay_target.clone();
         let window_weak = window.as_weak();
         let cfg_store_root = cfg_store_root.clone();
+        let cfg_target_language = cfg_target_language.clone();
         window.on_history_clicked(move |index| {
             let w = match window_weak.upgrade() {
                 Some(w) => w,
@@ -399,20 +455,17 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 }
             };
             // Same row mapping as make_transcript_updater: replay
-            // reuses build_rows so degraded/error marks match the
-            // live view.
-            let rows: Vec<TranscriptRow> = build_rows(&segments)
-                .into_iter()
-                .map(|row: UiTranscriptRow| TranscriptRow {
-                    speaker: row.speaker.into(),
-                    timestamp: row.timestamp.into(),
-                    text: row.text.into(),
-                    translation: row.translation.into(),
-                    degraded: row.degraded,
-                    error: row.error,
-                })
-                .collect();
+            // reuses build_rows so degraded/error and same-language
+            // marks match the live view. The Recording's own target
+            // language decides which of its Segments were
+            // same-language, not whatever is configured now.
+            let target_language = entry
+                .target_language
+                .clone()
+                .unwrap_or_else(|| cfg_target_language.clone());
+            let rows = to_ui_rows(&segments, &target_language);
             w.set_transcript_rows(ModelRc::new(VecModel::from(rows)));
+            w.set_target_language(target_language.as_str().into());
             w.set_replay_title(entry.title.clone().into());
             w.set_replay_open(true);
             *replay_target.borrow_mut() = Some(dir);
@@ -423,11 +476,15 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
         let replay_target = replay_target.clone();
         let window_weak = window.as_weak();
         let cfg_store_root = cfg_store_root.clone();
+        let cfg_target_language = cfg_target_language.clone();
         window.on_replay_back_clicked(move || {
             if let Some(w) = window_weak.upgrade() {
                 w.set_replay_open(false);
                 w.set_replay_title("".into());
                 w.set_transcript_rows(ModelRc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+                // A replayed Recording may have used a different target
+                // language; put the configured one back.
+                w.set_target_language(cfg_target_language.as_str().into());
             }
             *replay_target.borrow_mut() = None;
             refresh_history_rows(&cfg_store_root, window_weak.clone());
@@ -475,6 +532,8 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             }
         });
     }
+
+    window.set_target_language(cfg_target_language.as_str().into());
 
     // Seed the list so it shows on startup.
     refresh_history_rows(&cfg_store_root, window.as_weak());

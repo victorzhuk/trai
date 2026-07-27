@@ -75,6 +75,9 @@ impl FallbackTranslator {
             .lock()
             .expect("fallback translator mutex poisoned");
         if let Some(candidate) = recovered {
+            crate::debug!(
+                "translate: backend[{candidate}] recovered, leaving backend[{current_index}]"
+            );
             state.current_index = candidate;
         }
         state.last_probe_at = Some(Instant::now());
@@ -106,8 +109,15 @@ impl Translator for FallbackTranslator {
                         .expect("fallback translator mutex poisoned");
                     if state.current_index == index {
                         if index + 1 >= self.backends.len() {
+                            crate::debug!(
+                                "translate: backend[{index}] unavailable, no backends left: {e}"
+                            );
                             return Err(e);
                         }
+                        crate::debug!(
+                            "translate: backend[{index}] unavailable ({e}), failing over to backend[{}]",
+                            index + 1
+                        );
                         state.current_index = index + 1;
                         state.last_probe_at = Some(Instant::now());
                     }

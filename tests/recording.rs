@@ -49,7 +49,12 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
 // against the full known PCM, to learn the exact sample range it will
 // carve out as a Segment before we register that range with the fake.
 fn expected_span(samples: &[i16]) -> SpeechSpan {
-    let mut segmenter = Segmenter::new(VAD_THRESHOLD, SILENCE_HOLD_MS, DURATION_CAP_MS);
+    let mut segmenter = Segmenter::new(
+        VAD_THRESHOLD,
+        SILENCE_HOLD_MS,
+        DURATION_CAP_MS,
+        DURATION_CAP_MS,
+    );
     let mut spans: Vec<SpeechSpan> = segmenter
         .push_samples(samples)
         .into_iter()
@@ -106,6 +111,7 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
         confidence_floor: 0.0,
     };
 
@@ -131,10 +137,12 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
     mic_call.respond(Transcription {
         text: "mic said something".to_string(),
         mean_confidence: 0.9,
+        language: None,
     });
     monitor_call.respond(Transcription {
         text: "monitor said something".to_string(),
         mean_confidence: 0.85,
+        language: None,
     });
 
     recording.stop().unwrap();
@@ -282,6 +290,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
         confidence_floor: 0.0,
     };
 
@@ -311,6 +320,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
     monitor_call.respond(Transcription {
         text: "monitor said something".to_string(),
         mean_confidence: 0.85,
+        language: None,
     });
 
     // Give the monitor submission thread time to retire from
@@ -333,6 +343,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
     mic_call.respond(Transcription {
         text: "mic said something".to_string(),
         mean_confidence: 0.9,
+        language: None,
     });
 
     recording.stop().unwrap();
@@ -389,6 +400,7 @@ fn meta_json_is_written_at_start_with_title_and_source_names() {
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
         confidence_floor: 0.0,
     };
 
@@ -412,10 +424,12 @@ fn meta_json_is_written_at_start_with_title_and_source_names() {
     mic_call.respond(Transcription {
         text: "mic".to_string(),
         mean_confidence: 0.9,
+        language: None,
     });
     monitor_call.respond(Transcription {
         text: "monitor".to_string(),
         mean_confidence: 0.85,
+        language: None,
     });
 
     recording.stop().unwrap();

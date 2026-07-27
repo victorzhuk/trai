@@ -1,7 +1,16 @@
+use std::collections::BTreeMap;
+use std::time::Instant;
+
 use serde::Deserialize;
 
 use super::{TranscribeError, Transcriber, Transcription};
+use crate::language;
 use crate::segmenter::SAMPLE_RATE_HZ;
+
+/// What the server is asked for when no source language is configured.
+/// Omitting the field is not equivalent: whisper's own default is `en`,
+/// so an omitted field decodes English rather than detecting.
+const DETECT: &str = "auto";
 
 pub struct WhisperClient {
     base_url: String,
@@ -29,15 +38,14 @@ impl Transcriber for WhisperClient {
             .mime_str("audio/wav")
             .map_err(|e| TranscribeError::new(format!("failed to build multipart part: {e}")))?;
 
-        let mut form = reqwest::blocking::multipart::Form::new()
+        let form = reqwest::blocking::multipart::Form::new()
             .part("file", part)
             .text("response_format", "verbose_json")
-            .text("temperature", "0.0");
-        if let Some(lang) = language {
-            form = form.text("language", lang.to_string());
-        }
+            .text("temperature", "0.0")
+            .text("language", language_param(language).to_string());
 
         let url = format!("{}/inference", self.base_url);
+        let began = Instant::now();
         let response = self
             .client
             .post(&url)
@@ -45,11 +53,36 @@ impl Transcriber for WhisperClient {
             .send()
             .map_err(|e| TranscribeError::new(format!("whisper request failed: {e}")))?;
 
+        let status = response.status();
         let body = response
             .text()
             .map_err(|e| TranscribeError::new(format!("failed to read whisper response: {e}")))?;
 
+        crate::debug!(
+            "whisper: {} in {:.2}s for {:.1}s audio, {} bytes",
+            status,
+            began.elapsed().as_secs_f64(),
+            samples.len() as f64 / SAMPLE_RATE_HZ as f64,
+            body.len(),
+        );
+
+        // Without this a non-2xx reply reaches the JSON parser and surfaces
+        // as "invalid whisper response", which points at the wrong thing.
+        if !status.is_success() {
+            return Err(TranscribeError::new(format!(
+                "whisper returned {status}: {}",
+                crate::log::preview(&body, 200)
+            )));
+        }
+
         parse_transcription(&body)
+    }
+}
+
+fn language_param(configured: Option<&str>) -> &str {
+    match configured {
+        Some(language) if !language.trim().is_empty() => language.trim(),
+        _ => DETECT,
     }
 }
 
@@ -92,6 +125,16 @@ struct WhisperResponse {
     text: String,
     #[serde(default)]
     segments: Vec<WhisperSegment>,
+    // `language` is what the server decoded with, `detected_language`
+    // what it heard, both as English names. `language_probabilities` is
+    // keyed by code, and a BTreeMap so a tie resolves the same way
+    // every time.
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    detected_language: String,
+    #[serde(default)]
+    language_probabilities: BTreeMap<String, f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,9 +166,26 @@ fn parse_transcription(body: &str) -> Result<Transcription, TranscribeError> {
     };
 
     Ok(Transcription {
+        language: detected_language(&parsed),
         text: parsed.text,
         mean_confidence,
     })
+}
+
+// The probability map already speaks codes, so it is read first; the
+// name fields are the fallback for a server that reports only those.
+fn detected_language(parsed: &WhisperResponse) -> Option<String> {
+    let most_likely = parsed
+        .language_probabilities
+        .iter()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(code, _)| code.as_str());
+
+    most_likely
+        .and_then(language::canonical)
+        .or_else(|| language::canonical(&parsed.detected_language))
+        .or_else(|| language::canonical(&parsed.language))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -161,5 +221,44 @@ mod tests {
         let body = r#"{"text": "", "segments": []}"#;
         let transcription = parse_transcription(body).unwrap();
         assert_eq!(transcription.mean_confidence, 0.0);
+    }
+
+    #[test]
+    fn absent_configured_language_asks_the_server_to_detect() {
+        assert_eq!(language_param(None), "auto");
+        assert_eq!(language_param(Some("  ")), "auto");
+        assert_eq!(language_param(Some(" de ")), "de");
+    }
+
+    #[test]
+    fn most_likely_code_from_the_probability_map_wins() {
+        let body = r#"{
+            "text": " привет",
+            "language": "english",
+            "detected_language": "english",
+            "language_probabilities": {"en": 0.11, "ru": 0.81, "de": 0.08},
+            "segments": []
+        }"#;
+
+        let transcription = parse_transcription(body).unwrap();
+        assert_eq!(transcription.language.as_deref(), Some("ru"));
+    }
+
+    #[test]
+    fn language_name_is_used_when_no_probability_map_is_reported() {
+        let body = r#"{"text": " hallo", "detected_language": "german", "segments": []}"#;
+        let transcription = parse_transcription(body).unwrap();
+        assert_eq!(transcription.language.as_deref(), Some("de"));
+
+        let decoded_only = r#"{"text": " hallo", "language": "german", "segments": []}"#;
+        let transcription = parse_transcription(decoded_only).unwrap();
+        assert_eq!(transcription.language.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn reply_without_any_language_field_reports_none() {
+        let body = r#"{"text": " hello", "segments": []}"#;
+        let transcription = parse_transcription(body).unwrap();
+        assert_eq!(transcription.language, None);
     }
 }

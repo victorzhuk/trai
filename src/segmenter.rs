@@ -26,6 +26,7 @@ pub struct Segmenter {
     threshold: f32,
     silence_hold_samples: u64,
     duration_cap_samples: u64,
+    live_chunk_samples: u64,
     buffer: Vec<i16>,
     total_samples: u64,
     in_speech: bool,
@@ -35,12 +36,18 @@ pub struct Segmenter {
 }
 
 impl Segmenter {
-    pub fn new(threshold: f32, silence_hold_ms: u64, duration_cap_ms: u64) -> Self {
+    pub fn new(
+        threshold: f32,
+        silence_hold_ms: u64,
+        duration_cap_ms: u64,
+        live_chunk_ms: u64,
+    ) -> Self {
         Self {
             detector: earshot::Detector::default(),
             threshold,
             silence_hold_samples: ms_to_samples(silence_hold_ms),
             duration_cap_samples: ms_to_samples(duration_cap_ms),
+            live_chunk_samples: ms_to_samples(live_chunk_ms),
             buffer: Vec::new(),
             total_samples: 0,
             in_speech: false,
@@ -115,7 +122,18 @@ impl Segmenter {
             }
         }
 
-        if frame_end - self.segment_start >= self.duration_cap_samples {
+        // Mid-speech chunking: cut ongoing speech at whichever cap fires
+        // first. `live_chunk_ms` is the normal live-transcription interval
+        // (short, so text appears while the speaker is still talking);
+        // `duration_cap_ms` is a hard safety ceiling for when live_chunk
+        // is set higher or equal.
+        let chunk_samples = if self.live_chunk_samples < self.duration_cap_samples {
+            self.live_chunk_samples
+        } else {
+            self.duration_cap_samples
+        };
+
+        if frame_end - self.segment_start >= chunk_samples {
             let span = SpeechSpan {
                 start_sample: self.segment_start,
                 end_sample: frame_end,
@@ -167,7 +185,7 @@ mod tests {
         let speech = synthetic_speech_frame(speech_len, lead_silence_len);
         let silence_trail = vec![0i16; trail_silence_len];
 
-        let mut segmenter = Segmenter::new(0.5, 200, 20_000);
+        let mut segmenter = Segmenter::new(0.5, 200, 20_000, 20_000);
 
         let mut events = Vec::new();
         events.extend(segmenter.push_samples(&silence_lead[..1000]));
@@ -242,7 +260,7 @@ mod tests {
         let speech_len = FRAME_LEN * 200;
         let speech = synthetic_speech_frame(speech_len, 0);
 
-        let mut segmenter = Segmenter::new(0.5, 200, 500);
+        let mut segmenter = Segmenter::new(0.5, 200, 500, 500);
         let events = segmenter.push_samples(&speech);
 
         let spans: Vec<SpeechSpan> = events
@@ -281,5 +299,45 @@ mod tests {
             }),
             "a duration-cap close must be immediately followed by a reopen at the same boundary sample, in that order"
         );
+    }
+
+    #[test]
+    fn live_chunk_cuts_ongoing_speech_before_the_duration_cap() {
+        let speech_len = FRAME_LEN * 200;
+        let speech = synthetic_speech_frame(speech_len, 0);
+
+        // live_chunk_ms = 300 (shorter than duration_cap_ms = 500)
+        let mut segmenter = Segmenter::new(0.5, 200, 500, 300);
+        let events = segmenter.push_samples(&speech);
+
+        let spans: Vec<SpeechSpan> = events
+            .iter()
+            .filter_map(|e| match e {
+                SegmentEvent::Closed(span) => Some(*span),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            spans.len() >= 3,
+            "expected at least three live-chunk segments from 200 frames, got {}",
+            spans.len()
+        );
+
+        let chunk_samples = ms_to_samples(300);
+        for span in &spans {
+            let duration = span.end_sample - span.start_sample;
+            assert!(
+                duration >= chunk_samples
+                    && duration < chunk_samples + FRAME_LEN as u64,
+                "each live-chunk segment must be approximately live_chunk_ms long (within one frame), got {} samples",
+                duration
+            );
+        }
+
+        // No sample dropped or duplicated between consecutive chunks.
+        for w in spans.windows(2) {
+            assert_eq!(w[0].end_sample, w[1].start_sample);
+        }
     }
 }

@@ -5,13 +5,25 @@
 store_root = "/home/you/.local/share/trai/recordings"
 mic_source = "alsa_input.pci-0000_00_1f.3.analog-stereo"
 monitor_source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
-mic_language = "en"
-monitor_language = "de"
+# Optional per-Stream language overrides. Omit either one (or both) to
+# let the transcriber auto-detect the language of each Stream from the
+# audio. Set a code (ISO 639-1 or a full language name) to force that
+# Stream's language instead of detecting it.
+# mic_language = "en"
+# monitor_language = "de"
 whisper_url = "http://localhost:9000"
 target_language = "en"
 vad_threshold = 0.5
-silence_hold_ms = 500
+silence_hold_ms = 300
+# Hard ceiling on a single segment's duration. A segment that runs
+# longer than this is force-closed and a new one opens at the boundary.
 duration_cap_ms = 30000
+# How often to cut ongoing speech for live transcription. During
+# continuous speech a new segment is closed and transcribed every
+# this many milliseconds, so text appears while the speaker is
+# still talking. Set this equal to duration_cap_ms to disable
+# mid-speech chunking and only transcribe after silence.
+live_chunk_ms = 3000
 confidence_floor = 0.6
 
 [translate]

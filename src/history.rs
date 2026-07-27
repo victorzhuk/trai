@@ -10,6 +10,10 @@ pub struct RecordingEntry {
     pub title: String,
     pub start_time: u64,
     pub duration_secs: Option<u64>,
+    /// Target language this Recording was translated into, which is
+    /// what decides whether a Segment of it was same-language. Absent
+    /// on Recordings written before it was recorded.
+    pub target_language: Option<String>,
     pub line_count: usize,
 }
 
@@ -26,6 +30,8 @@ struct MetaSummary {
     start_time: Option<u64>,
     #[serde(default)]
     duration_secs: Option<u64>,
+    #[serde(default)]
+    target_language: Option<String>,
 }
 
 pub fn list_recordings(store_root: &Path) -> io::Result<Vec<RecordingEntry>> {
@@ -63,6 +69,7 @@ pub fn list_recordings(store_root: &Path) -> io::Result<Vec<RecordingEntry>> {
             title,
             start_time,
             duration_secs: summary.duration_secs,
+            target_language: summary.target_language,
             line_count,
         });
     }
@@ -108,8 +115,10 @@ mod tests {
             end_ms: id * 100 + 50,
             text: format!("segment {id}"),
             mean_confidence: 0.8,
+            source_language: None,
             translation: None,
             degraded: false,
+            state: crate::domain::SegmentState::Ready,
             translation_error: None,
         }
     }

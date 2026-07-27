@@ -1,15 +1,22 @@
-import { Button, ScrollView, VerticalBox, HorizontalBox, LineEdit, ComboBox } from "std-widgets.slint";
+import { Button, ScrollView, LineEdit, ComboBox, Palette } from "std-widgets.slint";
 
 // One row in the transcript panel. The Rust side rebuilds `[TranscriptRow]`
 // from the Pipeline's live-view snapshot on each Segment update, then hands it
 // to `set_transcript_rows` so late updates can replace pending text by index.
-// `degraded` marks a translation served by a fallback backend; `error` marks
-// a misconfigured backend's rejection surfaced in place of a translation.
+// `transcribing` marks a row whose text has not come back yet and `text-failed`
+// one whose transcription was refused; `verbatim` marks a Segment already in the
+// target language, `degraded` a translation served by a fallback backend, and
+// `error` a misconfigured backend's rejection surfaced in place of a translation.
 export struct TranscriptRow {
     speaker: string,
+    mine: bool,
     timestamp: string,
     text: string,
     translation: string,
+    transcribing: bool,
+    text-failed: bool,
+    pending: bool,
+    verbatim: bool,
     degraded: bool,
     error: bool,
 }
@@ -21,14 +28,342 @@ export struct HistoryRow {
     line-count: int,
 }
 
+// Derived from Palette so the window follows the system light/dark scheme.
+// The two status hues are fixed rather than scheme-branched: Palette reports
+// ColorScheme.unknown when the scheme comes from the system, so branching on
+// it would silently pick light-scheme colors on a dark desktop.
+//
+// `pad` and `gap` are shared by the card backdrop, the pane headers and every
+// transcript row: all three are laid out independently, and only identical
+// values keep the two columns on the same vertical edges.
+global Theme {
+    out property <brush> muted: Palette.foreground.transparentize(0.4);
+    out property <brush> faint: Palette.foreground.transparentize(0.65);
+    out property <brush> hairline: Palette.foreground.transparentize(0.88);
+    out property <brush> rule: Palette.foreground.transparentize(0.7);
+    out property <brush> danger: #ef4444;
+    out property <brush> warning: #d97706;
+    out property <length> pad: 12px;
+    out property <length> gap: 12px;
+    out property <length> inset: 14px;
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.hairline;
+}
+
+// Turns for as long as it exists, so it is placed behind an `if` on the
+// waiting state rather than being hidden: a still spinner would read as a
+// stalled request, and animation-tick keeps the window redrawing.
+component Spinner inherits Text {
+    property <float> phase: mod(animation-tick() / 130ms, 4);
+    text: root.phase < 1 ? "◐" : root.phase < 2 ? "◓" : root.phase < 3 ? "◑" : "◒";
+    font-size: 11px;
+    color: Theme.muted;
+    vertical-alignment: center;
+}
+
+component Spacer inherits Rectangle {
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+}
+
+// One column of the split. Zero preferred width with equal stretch is what
+// holds the two columns at exactly half each, so the card backdrop, the
+// headers and the rows all land on the same edges.
+component Half inherits Rectangle {
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+}
+
+component Card inherits Rectangle {
+    background: Palette.control-background;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: Theme.hairline;
+}
+
+component Pill inherits Rectangle {
+    in property <string> label;
+    in property <bool> live;
+
+    border-radius: 12px;
+    background: root.live ? Theme.danger.transparentize(0.86) : Palette.alternate-background;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            font-weight: root.live ? 700 : 400;
+            color: root.live ? Theme.danger : Theme.muted;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// One reading in the header's status line.
+component StatusChip inherits HorizontalLayout {
+    in property <string> label;
+    in property <bool> waiting: false;
+    in property <brush> ink: Theme.muted;
+
+    spacing: 5px;
+    alignment: center;
+
+    if root.waiting: Spinner {
+        color: root.ink;
+    }
+    Text {
+        text: root.label;
+        font-size: 11px;
+        color: root.ink;
+        vertical-alignment: center;
+    }
+}
+
+component PaneHeader inherits Half {
+    in property <string> label;
+    in property <string> detail;
+
+    VerticalLayout {
+        spacing: 0px;
+        HorizontalLayout {
+            padding-left: Theme.inset;
+            padding-right: Theme.inset;
+            padding-top: 10px;
+            padding-bottom: 9px;
+            spacing: 8px;
+            Text {
+                text: root.label;
+                font-size: 12px;
+                font-weight: 700;
+                color: Palette.foreground;
+            }
+            Spacer { }
+            Text {
+                text: root.detail;
+                font-size: 11px;
+                color: Theme.faint;
+            }
+        }
+        Divider { }
+    }
+}
+
+// One block of speech: a stripe carrying the side cue, a caption line, and
+// the text itself. Both columns use it so their captions share a baseline.
+component SpeechBlock inherits Rectangle {
+    in property <brush> stripe;
+    in property <string> caption;
+    in property <brush> caption-ink;
+    in property <string> body;
+    in property <brush> ink;
+    in property <bool> italic: false;
+    in property <bool> waiting: false;
+    in property <length> trailing: Theme.inset;
+
+    HorizontalLayout {
+        padding-left: Theme.inset;
+        padding-right: root.trailing;
+        padding-top: 7px;
+        padding-bottom: 7px;
+        spacing: 10px;
+
+        Rectangle {
+            width: 3px;
+            border-radius: 1.5px;
+            background: root.stripe;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            preferred-width: 0px;
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: 5px;
+                if root.waiting: Spinner { }
+                Text {
+                    text: root.caption;
+                    font-size: 11px;
+                    color: root.caption-ink;
+                    vertical-alignment: center;
+                }
+                Spacer { }
+            }
+            Text {
+                text: root.body;
+                wrap: word-wrap;
+                font-size: 13px;
+                font-italic: root.italic;
+                color: root.ink;
+            }
+        }
+    }
+}
+
+// One transcript row spanning both columns. Original and translation sit in
+// the same row of the same scrolling container, so they cannot drift apart.
+component TranscriptLine inherits Rectangle {
+    in property <TranscriptRow> entry;
+
+    HorizontalLayout {
+        spacing: Theme.gap;
+
+        Half {
+            SpeechBlock {
+                stripe: root.entry.text-failed ? Theme.danger
+                    : root.entry.mine ? Palette.accent-background
+                    : Theme.rule;
+                caption: root.entry.text-failed
+                    ? "✕ transcription failed · " + root.entry.timestamp
+                    : root.entry.speaker + " · " + root.entry.timestamp;
+                caption-ink: root.entry.text-failed ? Theme.danger : Theme.muted;
+                waiting: root.entry.transcribing;
+                body: root.entry.text;
+                italic: root.entry.transcribing;
+                ink: root.entry.text-failed ? Theme.danger
+                    : root.entry.transcribing ? Theme.faint
+                    : Palette.foreground;
+            }
+        }
+        Half {
+            SpeechBlock {
+                // Clears the scrollbar, which overlays the right card edge.
+                trailing: Theme.inset + 8px;
+                stripe: root.entry.error ? Theme.danger
+                    : root.entry.degraded ? Theme.warning
+                    : Theme.rule;
+                caption: root.entry.error ? "✕ translation failed"
+                    : root.entry.degraded ? "⚠ fallback backend"
+                    : root.entry.verbatim ? "= same language"
+                    : root.entry.pending ? "translating…"
+                    : root.entry.timestamp;
+                caption-ink: root.entry.error ? Theme.danger
+                    : root.entry.degraded ? Theme.warning
+                    : Theme.muted;
+                waiting: root.entry.pending && !root.entry.text-failed;
+                body: root.entry.translation;
+                italic: root.entry.pending;
+                ink: root.entry.error ? Theme.danger
+                    : root.entry.pending ? Theme.faint
+                    : root.entry.verbatim ? Theme.muted
+                    : Palette.foreground;
+            }
+        }
+    }
+}
+
+component TranscriptSplit inherits Rectangle {
+    in property <[TranscriptRow]> rows;
+    in property <string> target-language;
+    in property <string> empty-text;
+    in property <bool> follow-tail: false;
+
+    // viewport-y runs from `bottom-y` (fully scrolled) up to 0.
+    property <length> bottom-y: min(0px, list.visible-height - list.viewport-height);
+    property <bool> stick-to-end: root.follow-tail;
+
+    HorizontalLayout {
+        padding: Theme.pad;
+        spacing: Theme.gap;
+        Card { }
+        Card { }
+    }
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: 0px;
+
+        HorizontalLayout {
+            // Text and the spacer both accept unbounded height, so without
+            // this the header row splits the free space with the list.
+            vertical-stretch: 0;
+            spacing: Theme.gap;
+            PaneHeader {
+                label: "Original";
+            }
+            PaneHeader {
+                label: "Translation";
+                detail: root.target-language;
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+
+            list := ScrollView {
+                horizontal-scrollbar-policy: always-off;
+                viewport-width: self.visible-width;
+
+                // A new Segment grows the viewport; follow it only when the
+                // view is already at the bottom, so reading back through a
+                // live transcript is not yanked away by the next row.
+                changed viewport-height => {
+                    if (root.stick-to-end) {
+                        list.viewport-y = root.bottom-y;
+                    }
+                }
+                changed viewport-y => {
+                    root.stick-to-end = list.viewport-y <= root.bottom-y + 4px;
+                }
+
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 6px;
+                    padding-bottom: 10px;
+                    spacing: 0px;
+
+                    for entry in root.rows: TranscriptLine {
+                        entry: entry;
+                    }
+                }
+            }
+
+            if root.rows.length == 0: Text {
+                text: root.empty-text;
+                color: Theme.faint;
+                font-size: 13px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "trai";
-    preferred-width: 600px;
-    preferred-height: 400px;
+    preferred-width: 1040px;
+    preferred-height: 660px;
+    min-width: 760px;
+    min-height: 420px;
+    background: Palette.background;
 
     in property <[TranscriptRow]> transcript-rows;
     in property <bool> recording-active: false;
-    in property <string> status-text: "stopped";
+    // Set while stop() drains the reader and submission threads. The
+    // transcript stays on screen through the drain, since late Segments
+    // still land during it.
+    in property <bool> stopping: false;
+    in property <string> status-text: "";
+    in property <string> target-language: "";
+
+    // Derived from the same live-view snapshot the panels are built from,
+    // so the status line cannot disagree with the rows.
+    in property <int> pending-transcriptions: 0;
+    in property <int> pending-translations: 0;
+    in property <int> failed-transcriptions: 0;
+    in property <string> mic-language: "";
+    in property <string> monitor-language: "";
+    in property <bool> translation-degraded: false;
+
+    property <bool> busy: root.recording-active || root.stopping;
 
     // Wizard state. `wizard-open` is flipped on by start-clicked after
     // enumerating sources, and off by begin/cancel. Hidden while a
@@ -53,6 +388,7 @@ export component AppWindow inherits Window {
 
     callback start-clicked();
     callback stop-clicked();
+    callback force-stop-clicked();
     callback begin-clicked();
     callback cancel-wizard-clicked();
     callback history-clicked(int);
@@ -61,11 +397,19 @@ export component AppWindow inherits Window {
     callback confirm-delete-clicked();
     callback cancel-delete-clicked();
 
-    VerticalBox {
-        HorizontalBox {
+    VerticalLayout {
+        spacing: 0px;
+
+        HorizontalLayout {
+            padding: 10px;
+            padding-left: Theme.inset;
+            padding-right: Theme.inset;
+            spacing: 8px;
+
             Button {
                 text: "Start";
-                enabled: !root.recording-active;
+                primary: true;
+                enabled: !root.busy;
                 clicked => { root.start-clicked(); }
             }
             Button {
@@ -73,172 +417,333 @@ export component AppWindow inherits Window {
                 enabled: root.recording-active;
                 clicked => { root.stop-clicked(); }
             }
-            Text {
-                text: root.recording-active ? "Recording" : root.status-text;
+            // Appears only while stop() is draining: lets the user
+            // abandon waiting for dead translation backends.
+            if root.stopping: Button {
+                text: "Force stop";
+                clicked => { root.force-stop-clicked(); }
             }
-        }
-
-        // In-place wizard panel: shown only when the user has opened it
-        // and no recording is active. Replaces the transcript area for
-        // the duration of source selection.
-        if root.wizard-open && !root.recording-active: VerticalBox {
-            Text {
-                text: "New recording";
-                font-weight: 700;
-            }
-            LineEdit {
-                placeholder-text: "Title";
-                text <=> root.wizard-title;
-            }
-            Text { text: "Microphone"; }
-            ComboBox {
-                model <=> root.mic-source-names;
-                current-index <=> root.mic-selected-index;
-            }
-            Text { text: "Monitor"; }
-            ComboBox {
-                model <=> root.monitor-source-names;
-                current-index <=> root.monitor-selected-index;
-            }
-            Text { text: "Store root: " + root.store-root-display; }
-            HorizontalBox {
-                Button {
-                    text: "Begin";
-                    clicked => { root.begin-clicked(); }
+            Spacer { }
+            if root.busy: HorizontalLayout {
+                spacing: 12px;
+                if root.mic-language != "": StatusChip {
+                    label: "me " + root.mic-language;
                 }
-                Button {
-                    text: "Cancel";
-                    clicked => { root.cancel-wizard-clicked(); }
+                if root.monitor-language != "": StatusChip {
+                    label: "them " + root.monitor-language;
+                }
+                if root.pending-transcriptions > 0: StatusChip {
+                    label: "\{root.pending-transcriptions} transcribing";
+                    waiting: true;
+                }
+                if root.pending-translations > 0: StatusChip {
+                    label: "\{root.pending-translations} translating";
+                    waiting: true;
+                }
+                if root.failed-transcriptions > 0: StatusChip {
+                    label: "\{root.failed-transcriptions} failed";
+                    ink: Theme.danger;
+                }
+                if root.translation-degraded: StatusChip {
+                    label: "fallback backend";
+                    ink: Theme.warning;
                 }
             }
-        }
-
-        // Live transcript, only while a recording is in flight.
-        if root.recording-active: ScrollView {
+            if root.status-text != "": VerticalLayout {
+                alignment: center;
+                Text {
+                    text: root.status-text;
+                    color: Theme.danger;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+            }
             VerticalLayout {
-                for row in root.transcript-rows: HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 12px;
-                    Text { text: row.speaker; min-width: 42px; max-width: 42px; }
-                    Text { text: row.timestamp; min-width: 48px; max-width: 48px; }
-                    Text { text: row.text; horizontal-stretch: 1; min-width: 0px; }
-                    Text {
-                        text: row.error ? "✕" : row.degraded ? "⚠" : "";
-                        min-width: 18px;
-                        max-width: 18px;
-                        color: row.error ? red : row.degraded ? #b45309 : black;
+                alignment: center;
+                Pill {
+                    label: root.recording-active ? "Recording"
+                        : root.stopping ? "Stopping…"
+                        : "Idle";
+                    live: root.recording-active;
+                }
+            }
+        }
+        Divider { }
+
+        Rectangle {
+            vertical-stretch: 1;
+
+            // In-place wizard: shown only when the user has opened it and
+            // no recording is active. Replaces the transcript area for the
+            // duration of source selection.
+            if root.wizard-open && !root.busy: VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    alignment: center;
+                    Card {
+                        width: 460px;
+
+                        VerticalLayout {
+                            padding: 20px;
+                            spacing: 10px;
+
+                            Text {
+                                text: "New recording";
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Text { text: "Title"; font-size: 11px; color: Theme.muted; }
+                            LineEdit {
+                                placeholder-text: "Title";
+                                text <=> root.wizard-title;
+                            }
+                            Text { text: "Microphone"; font-size: 11px; color: Theme.muted; }
+                            ComboBox {
+                                model <=> root.mic-source-names;
+                                current-index <=> root.mic-selected-index;
+                            }
+                            Text { text: "Monitor"; font-size: 11px; color: Theme.muted; }
+                            ComboBox {
+                                model <=> root.monitor-source-names;
+                                current-index <=> root.monitor-selected-index;
+                            }
+                            Text {
+                                text: "Saving to " + root.store-root-display;
+                                font-size: 11px;
+                                color: Theme.faint;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                Button {
+                                    text: "Cancel";
+                                    clicked => { root.cancel-wizard-clicked(); }
+                                }
+                                Button {
+                                    text: "Begin";
+                                    primary: true;
+                                    clicked => { root.begin-clicked(); }
+                                }
+                            }
+                        }
                     }
-                    Text {
-                        text: row.translation;
+                }
+            }
+
+            // Live transcript, only while a recording is in flight.
+            if root.busy: TranscriptSplit {
+                rows: root.transcript-rows;
+                target-language: root.target-language;
+                follow-tail: true;
+                empty-text: "Listening — speech shows up here as it is transcribed.";
+            }
+
+            // Replay of a stored recording. Same split as the live view,
+            // fed from history::read_transcript so degraded marks appear as
+            // they did live. No capture is started here; Back returns to the
+            // list, Delete opens the confirmation.
+            if !root.wizard-open && !root.busy && root.replay-open: VerticalLayout {
+                spacing: 0px;
+
+                HorizontalLayout {
+                    padding: 10px;
+                    padding-left: Theme.inset;
+                    padding-right: Theme.inset;
+                    spacing: 8px;
+
+                    VerticalLayout {
                         horizontal-stretch: 1;
                         min-width: 0px;
-                        color: row.error ? red : row.degraded ? #b45309 : black;
-                    }
-                }
-            }
-        }
-
-        // Replay of a stored recording. Same transcript row layout as
-        // the live view, fed from history::read_transcript so degraded
-        // marks appear as they did live. No capture is started here;
-        // Back returns to the list, Delete opens the confirmation.
-        if !root.wizard-open && !root.recording-active && root.replay-open: VerticalBox {
-            HorizontalBox {
-                Text {
-                    text: root.replay-title;
-                    font-weight: 700;
-                    horizontal-stretch: 1;
-                }
-                Button {
-                    text: "Back";
-                    clicked => { root.replay-back-clicked(); }
-                }
-                Button {
-                    text: "Delete";
-                    clicked => { root.delete-clicked(); }
-                }
-            }
-            ScrollView {
-                VerticalLayout {
-                    for row in root.transcript-rows: HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        spacing: 12px;
-                        Text { text: row.speaker; min-width: 42px; max-width: 42px; }
-                        Text { text: row.timestamp; min-width: 48px; max-width: 48px; }
-                        Text { text: row.text; horizontal-stretch: 1; min-width: 0px; }
+                        preferred-width: 0px;
+                        alignment: center;
                         Text {
-                            text: row.error ? "✕" : row.degraded ? "⚠" : "";
-                            min-width: 18px;
-                            max-width: 18px;
-                            color: row.error ? red : row.degraded ? #b45309 : black;
-                        }
-                        Text {
-                            text: row.translation;
-                            horizontal-stretch: 1;
-                            min-width: 0px;
-                            color: row.error ? red : row.degraded ? #b45309 : black;
+                            text: root.replay-title;
+                            font-size: 14px;
+                            font-weight: 700;
+                            overflow: elide;
                         }
                     }
+                    Button {
+                        text: "Back";
+                        clicked => { root.replay-back-clicked(); }
+                    }
+                    Button {
+                        text: "Delete";
+                        clicked => { root.delete-clicked(); }
+                    }
+                }
+                Divider { }
+                TranscriptSplit {
+                    vertical-stretch: 1;
+                    rows: root.transcript-rows;
+                    target-language: root.target-language;
+                    empty-text: "This recording has no transcript.";
                 }
             }
-        }
 
-        // History list, shown when idle: newest first, click a row to
-        // replay that recording.
-        if !root.wizard-open && !root.recording-active && !root.replay-open: VerticalBox {
-            Text {
-                text: "History";
-                font-weight: 700;
-            }
-            ScrollView {
-                VerticalLayout {
-                    for row[index] in root.history-rows: Rectangle {
+            // History list, shown when idle: newest first, click a row to
+            // replay that recording.
+            if !root.wizard-open && !root.busy && !root.replay-open: VerticalLayout {
+                padding: Theme.pad;
+                spacing: 0px;
+
+                Card {
+                    VerticalLayout {
+                        spacing: 0px;
+
                         HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 12px;
+                            vertical-stretch: 0;
+                            padding-left: Theme.inset;
+                            padding-right: Theme.inset;
+                            padding-top: 10px;
+                            padding-bottom: 9px;
                             Text {
-                                text: row.title;
-                                horizontal-stretch: 1;
-                                min-width: 0px;
+                                text: "History";
+                                font-size: 12px;
+                                font-weight: 700;
                             }
-                            Text { text: row.date; min-width: 96px; max-width: 96px; }
-                            Text { text: row.duration; min-width: 48px; max-width: 48px; }
+                            Spacer { }
                             Text {
-                                text: row.line-count;
-                                min-width: 36px;
-                                max-width: 36px;
+                                text: "\{root.history-rows.length} recordings";
+                                font-size: 11px;
+                                color: Theme.faint;
                             }
                         }
-                        TouchArea {
-                            width: parent.width;
-                            height: parent.height;
-                            clicked => { root.history-clicked(index); }
+                        Divider { }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+
+                            ScrollView {
+                                horizontal-scrollbar-policy: always-off;
+                                viewport-width: self.visible-width;
+
+                                VerticalLayout {
+                                    alignment: start;
+
+                                    for row[index] in root.history-rows: Rectangle {
+                                        height: 48px;
+                                        background: touch.has-hover ? Palette.alternate-background : transparent;
+
+                                        HorizontalLayout {
+                                            padding-left: Theme.inset;
+                                            padding-right: Theme.inset + 8px;
+                                            spacing: 12px;
+
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                min-width: 0px;
+                                                preferred-width: 0px;
+                                                alignment: center;
+                                                Text {
+                                                    text: row.title;
+                                                    font-size: 13px;
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: row.date;
+                                                    font-size: 12px;
+                                                    color: Theme.muted;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: row.duration;
+                                                    font-size: 12px;
+                                                    color: Theme.muted;
+                                                    width: 48px;
+                                                    horizontal-alignment: right;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: "\{row.line-count} lines";
+                                                    font-size: 12px;
+                                                    color: Theme.faint;
+                                                    width: 72px;
+                                                    horizontal-alignment: right;
+                                                }
+                                            }
+                                        }
+
+                                        Divider {
+                                            y: parent.height - 1px;
+                                        }
+
+                                        touch := TouchArea {
+                                            width: parent.width;
+                                            height: parent.height;
+                                            clicked => { root.history-clicked(index); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if root.history-rows.length == 0: Text {
+                                text: "No recordings yet — press Start to make one.";
+                                color: Theme.faint;
+                                font-size: 13px;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                            }
                         }
                     }
                 }
             }
         }
+    }
 
-        // Delete confirmation overlay; names the recording being
-        // removed and wipes its transcript + audio on confirm.
-        if root.delete-confirmation-open: VerticalBox {
-            Text {
-                text: "Delete \"" + root.delete-target-name + "\"? This removes its transcript and audio.";
-            }
-            HorizontalBox {
-                Button {
-                    text: "Delete";
-                    clicked => { root.confirm-delete-clicked(); }
-                }
-                Button {
-                    text: "Cancel";
-                    clicked => { root.cancel-delete-clicked(); }
+    // Delete confirmation, drawn over the whole window so the list behind it
+    // cannot be clicked while it is open.
+    if root.delete-confirmation-open: Rectangle {
+        background: #00000099;
+        TouchArea { }
+
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Card {
+                    width: 420px;
+                    background: Palette.background;
+
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Delete \"" + root.delete-target-name + "\"?";
+                            font-size: 15px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "This removes its transcript and audio, and cannot be undone.";
+                            font-size: 12px;
+                            color: Theme.muted;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: end;
+                            Button {
+                                text: "Cancel";
+                                clicked => { root.cancel-delete-clicked(); }
+                            }
+                            Button {
+                                text: "Delete";
+                                clicked => { root.confirm-delete-clicked(); }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
-

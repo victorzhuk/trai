@@ -16,6 +16,7 @@ pub struct Config {
     pub vad_threshold: f32,
     pub silence_hold_ms: u64,
     pub duration_cap_ms: u64,
+    pub live_chunk_ms: u64,
     pub confidence_floor: f32,
 }
 
@@ -96,6 +97,7 @@ struct RawConfig {
     vad_threshold: Option<f32>,
     silence_hold_ms: Option<u64>,
     duration_cap_ms: Option<u64>,
+    live_chunk_ms: Option<u64>,
     confidence_floor: Option<f32>,
 }
 
@@ -228,6 +230,9 @@ impl Config {
         let duration_cap_ms = raw
             .duration_cap_ms
             .ok_or(ConfigError::Missing("duration_cap_ms"))?;
+        let live_chunk_ms = raw
+            .live_chunk_ms
+            .ok_or(ConfigError::Missing("live_chunk_ms"))?;
         let confidence_floor = raw
             .confidence_floor
             .ok_or(ConfigError::Missing("confidence_floor"))?;
@@ -247,6 +252,9 @@ impl Config {
         if duration_cap_ms == 0 {
             return Err(invalid("duration_cap_ms", "must be greater than 0"));
         }
+        if live_chunk_ms == 0 {
+            return Err(invalid("live_chunk_ms", "must be greater than 0"));
+        }
 
         Ok(Config {
             store_root,
@@ -260,6 +268,7 @@ impl Config {
             vad_threshold,
             silence_hold_ms,
             duration_cap_ms,
+            live_chunk_ms,
             confidence_floor,
         })
     }
@@ -281,6 +290,7 @@ mod tests {
             vad_threshold = 0.5
             silence_hold_ms = 500
             duration_cap_ms = 30000
+            live_chunk_ms = 3000
             confidence_floor = 0.6
 
             [translate]
@@ -376,6 +386,7 @@ mod tests {
             vad_threshold = 0.5
             silence_hold_ms = 500
             duration_cap_ms = 30000
+            live_chunk_ms = 3000
             confidence_floor = 0.6
 
             [translate]
@@ -413,6 +424,7 @@ mod tests {
             "vad_threshold",
             "silence_hold_ms",
             "duration_cap_ms",
+            "live_chunk_ms",
             "confidence_floor",
         ];
 
@@ -438,6 +450,7 @@ mod tests {
             vad_threshold = 0.5
             silence_hold_ms = 500
             duration_cap_ms = 30000
+            live_chunk_ms = 3000
             confidence_floor = 0.6
 
             [translate]
@@ -463,6 +476,7 @@ mod tests {
             vad_threshold = 0.5
             silence_hold_ms = 500
             duration_cap_ms = 30000
+            live_chunk_ms = 3000
             confidence_floor = 0.6
 
             [translate]
@@ -569,6 +583,14 @@ mod tests {
 
         let err = Config::from_toml_str(&toml).unwrap_err();
         assert!(err.to_string().contains("duration_cap_ms"));
+    }
+
+    #[test]
+    fn zero_live_chunk_ms_names_that_key_in_the_error() {
+        let toml = valid_toml().replace("live_chunk_ms = 3000", "live_chunk_ms = 0");
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("live_chunk_ms"));
     }
 
     fn remove_line_starting_with(toml: &str, key: &str) -> String {

@@ -1,1 +1,21 @@
+# Rust build artifacts
 /target
+
+# Local config (contains machine-specific sources and API keys)
+config.toml
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tooling caches
+.codegraph/
+.claude/
+.worktrees/

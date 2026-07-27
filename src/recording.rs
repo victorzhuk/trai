@@ -27,6 +27,7 @@ pub struct RecordingParams {
     pub vad_threshold: f32,
     pub silence_hold_ms: u64,
     pub duration_cap_ms: u64,
+    pub live_chunk_ms: u64,
     pub confidence_floor: f32,
 }
 
@@ -60,6 +61,20 @@ impl Recording {
         translator: Arc<dyn Translator>,
         on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
     ) -> io::Result<Self> {
+        crate::debug!(
+            "recording: start mic={} monitor={} dir={} langs={:?}/{:?} vad={} hold={}ms cap={}ms chunk={}ms floor={}",
+            params.mic_source,
+            params.monitor_source,
+            params.store_dir.display(),
+            params.mic_language,
+            params.monitor_language,
+            params.vad_threshold,
+            params.silence_hold_ms,
+            params.duration_cap_ms,
+            params.live_chunk_ms,
+            params.confidence_floor,
+        );
+
         let mut mic_child = pw_record::spawn(&params.mic_source)?;
         let mic_stdout = mic_child
             .stdout
@@ -138,6 +153,7 @@ impl Recording {
             translator,
             store,
             params.confidence_floor,
+            params.target_language.clone(),
         ));
         // Register the live-view callback before either reader thread
         // is spawned: a segment can arrive the instant a reader
@@ -159,6 +175,7 @@ impl Recording {
                 vad_threshold: params.vad_threshold,
                 silence_hold_ms: params.silence_hold_ms,
                 duration_cap_ms: params.duration_cap_ms,
+                live_chunk_ms: params.live_chunk_ms,
             };
             thread::spawn(move || {
                 run_reader(mic_source, mic_wav, reader_params, pipeline, submissions)
@@ -174,6 +191,7 @@ impl Recording {
                 vad_threshold: params.vad_threshold,
                 silence_hold_ms: params.silence_hold_ms,
                 duration_cap_ms: params.duration_cap_ms,
+                live_chunk_ms: params.live_chunk_ms,
             };
             thread::spawn(move || {
                 run_reader(
@@ -199,26 +217,58 @@ impl Recording {
         })
     }
 
+    /// Returns the shared Pipeline so callers (e.g., a force-stop
+    /// button) can signal it without owning the Recording.
+    pub fn pipeline(&self) -> &Arc<Pipeline> {
+        &self.pipeline
+    }
+
     pub fn stop(mut self) -> io::Result<()> {
+        // Each stage is timed separately: the UI stays in its "stopping"
+        // state for the sum of these, so a slow stop needs to name which
+        // stage is slow.
+        let began = Instant::now();
         if let Some(mut child) = self.mic_child.take() {
             pw_record::stop(&mut child)?;
         }
         if let Some(mut child) = self.monitor_child.take() {
             pw_record::stop(&mut child)?;
         }
+        crate::debug!(
+            "stop: capture killed in {:.2}s",
+            began.elapsed().as_secs_f64()
+        );
 
+        let at_readers = Instant::now();
         let mic_result = self.mic_reader.join().expect("mic reader thread panicked");
         let monitor_result = self
             .monitor_reader
             .join()
             .expect("monitor reader thread panicked");
+        crate::debug!(
+            "stop: readers joined in {:.2}s",
+            at_readers.elapsed().as_secs_f64()
+        );
 
+        let at_submissions = Instant::now();
         let handles =
             std::mem::take(&mut *self.submissions.lock().expect("submissions mutex poisoned"));
+        let pending = handles.len();
         for handle in handles {
             handle.join().expect("segment submission thread panicked");
         }
+        crate::debug!(
+            "stop: {pending} submissions joined in {:.2}s",
+            at_submissions.elapsed().as_secs_f64()
+        );
+
+        let at_translations = Instant::now();
         self.pipeline.drain_translations();
+        crate::debug!(
+            "stop: translations drained in {:.2}s (total {:.2}s)",
+            at_translations.elapsed().as_secs_f64(),
+            began.elapsed().as_secs_f64()
+        );
 
         mic_result?;
         monitor_result?;
@@ -237,6 +287,7 @@ struct ReaderParams {
     vad_threshold: f32,
     silence_hold_ms: u64,
     duration_cap_ms: u64,
+    live_chunk_ms: u64,
 }
 
 fn run_reader<R: io::Read>(
@@ -252,13 +303,24 @@ fn run_reader<R: io::Read>(
         vad_threshold,
         silence_hold_ms,
         duration_cap_ms,
+        live_chunk_ms,
     } = params;
 
-    let mut segmenter = Segmenter::new(vad_threshold, silence_hold_ms, duration_cap_ms);
+    let mut segmenter = Segmenter::new(
+        vad_threshold,
+        silence_hold_ms,
+        duration_cap_ms,
+        live_chunk_ms,
+    );
     let mut buffer: Vec<i16> = Vec::new();
+    // Counted so a stream that captures nothing — the signature of a
+    // mis-targeted source — is visible at stop instead of silent.
+    let mut samples_read: u64 = 0;
+    let mut segments_closed: u32 = 0;
 
     tee_pcm_to_wav(source, &mut wav, |chunk| {
         buffer.extend_from_slice(chunk);
+        samples_read += chunk.len() as u64;
         for event in segmenter.push_samples(chunk) {
             match event {
                 // Registered synchronously, right here on the reader
@@ -270,6 +332,14 @@ fn run_reader<R: io::Read>(
                     pipeline.begin(segmenter::to_ms(start_sample));
                 }
                 SegmentEvent::Closed(span) => {
+                    segments_closed += 1;
+                    crate::debug!(
+                        "segment closed {:?} {}..{}ms ({} samples)",
+                        speaker_tag,
+                        segmenter::to_ms(span.start_sample),
+                        segmenter::to_ms(span.end_sample),
+                        span.end_sample - span.start_sample,
+                    );
                     spawn_submission(
                         &pipeline,
                         &submissions,
@@ -286,6 +356,7 @@ fn run_reader<R: io::Read>(
     if let Some(span) = segmenter.finish() {
         // Its Opened event already fired earlier, when this trailing
         // span first opened mid-stream -- no begin() call needed here.
+        segments_closed += 1;
         spawn_submission(
             &pipeline,
             &submissions,
@@ -295,6 +366,14 @@ fn run_reader<R: io::Read>(
             span,
         );
     }
+
+    crate::debug!(
+        "reader {:?} ended: {} samples ({:.1}s), {} segments",
+        speaker_tag,
+        samples_read,
+        samples_read as f64 / segmenter::SAMPLE_RATE_HZ as f64,
+        segments_closed,
+    );
 
     wav.finalize()
 }

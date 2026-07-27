@@ -10,6 +10,9 @@ use std::fmt;
 pub struct Transcription {
     pub text: String,
     pub mean_confidence: f32,
+    /// Language the server reported detecting, as an ISO 639-1 code.
+    /// `None` when the server reported nothing recognisable.
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

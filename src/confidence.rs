@@ -7,7 +7,7 @@ pub fn passes_floor(segment: &Segment, floor: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::SpeakerTag;
+    use crate::domain::{SegmentState, SpeakerTag};
 
     fn make_segment(mean_confidence: f32) -> Segment {
         Segment {
@@ -17,8 +17,10 @@ mod tests {
             end_ms: 100,
             text: "hello".to_string(),
             mean_confidence,
+            source_language: None,
             translation: None,
             degraded: false,
+            state: SegmentState::Ready,
             translation_error: None,
         }
     }

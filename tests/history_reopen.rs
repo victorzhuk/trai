@@ -45,7 +45,12 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
 }
 
 fn expected_span(samples: &[i16]) -> SpeechSpan {
-    let mut segmenter = Segmenter::new(VAD_THRESHOLD, SILENCE_HOLD_MS, DURATION_CAP_MS);
+    let mut segmenter = Segmenter::new(
+        VAD_THRESHOLD,
+        SILENCE_HOLD_MS,
+        DURATION_CAP_MS,
+        DURATION_CAP_MS,
+    );
     let mut spans: Vec<SpeechSpan> = segmenter
         .push_samples(samples)
         .into_iter()
@@ -102,6 +107,7 @@ fn record_stop_reopen_transcript_matches_captured_lines() {
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
         confidence_floor: 0.0,
     };
 
@@ -120,10 +126,12 @@ fn record_stop_reopen_transcript_matches_captured_lines() {
     mic_call.respond(Transcription {
         text: "mic said something".to_string(),
         mean_confidence: 0.9,
+        language: None,
     });
     monitor_call.respond(Transcription {
         text: "monitor said something".to_string(),
         mean_confidence: 0.85,
+        language: None,
     });
 
     recording.stop().unwrap();

@@ -102,8 +102,10 @@ mod tests {
             end_ms: id * 100 + 50,
             text: format!("segment {id}"),
             mean_confidence: 0.8,
+            source_language: None,
             translation: None,
             degraded: false,
+            state: crate::domain::SegmentState::Ready,
             translation_error: None,
         }
     }
@@ -177,6 +179,35 @@ mod tests {
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].translation.as_deref(), Some("hola"));
         assert!(read_back[0].degraded);
+    }
+
+    #[test]
+    fn source_language_round_trips_and_is_omitted_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let detected = Segment {
+            source_language: Some("ru".to_string()),
+            ..make_segment(1)
+        };
+        let unknown = make_segment(2);
+
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&detected).unwrap();
+        store.append(&unknown).unwrap();
+        drop(store);
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let (first, second) = raw.split_once('\n').unwrap();
+        assert!(first.contains(r#""source_language":"ru""#));
+        assert!(
+            !second.contains("source_language"),
+            "a Segment with no source language must not carry the key at all"
+        );
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back[0].source_language.as_deref(), Some("ru"));
+        assert_eq!(read_back[1].source_language, None);
     }
 
     #[test]
