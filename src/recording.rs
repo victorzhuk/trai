@@ -17,6 +17,7 @@ use crate::translator::Translator;
 
 pub struct RecordingParams {
     pub store_dir: PathBuf,
+    pub title: String,
     pub mic_source: String,
     pub monitor_source: String,
     pub mic_language: Option<String>,
@@ -25,6 +26,13 @@ pub struct RecordingParams {
     pub silence_hold_ms: u64,
     pub duration_cap_ms: u64,
     pub confidence_floor: f32,
+}
+
+#[derive(serde::Serialize)]
+struct RecordingMeta {
+    title: String,
+    mic_source: String,
+    monitor_source: String,
 }
 
 pub struct Recording {
@@ -95,6 +103,16 @@ impl Recording {
         R2: io::Read + Send + 'static,
     {
         fs::create_dir_all(&params.store_dir)?;
+
+        // Written at start, not stop, so a mid-meeting crash still
+        // leaves the recording self-describing on disk.
+        let meta = RecordingMeta {
+            title: params.title.clone(),
+            mic_source: params.mic_source.clone(),
+            monitor_source: params.monitor_source.clone(),
+        };
+        let meta_json = serde_json::to_string_pretty(&meta).map_err(io::Error::other)?;
+        fs::write(params.store_dir.join("meta.json"), meta_json)?;
 
         let store = Store::open(&params.store_dir.join("segments.jsonl"))?;
         let pipeline = Arc::new(Pipeline::new(

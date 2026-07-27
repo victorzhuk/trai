@@ -1,4 +1,4 @@
-import { Button, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, ScrollView, VerticalBox, HorizontalBox, LineEdit, ComboBox } from "std-widgets.slint";
 
 // One row in the transcript panel. The Rust side rebuilds `[TranscriptRow]`
 // from the Pipeline's live-view snapshot on each Segment update, then hands it
@@ -22,8 +22,22 @@ export component AppWindow inherits Window {
     in property <[TranscriptRow]> transcript-rows;
     in property <bool> recording-active: false;
     in property <string> status-text: "stopped";
+
+    // Wizard state. `wizard-open` is flipped on by start-clicked after
+    // enumerating sources, and off by begin/cancel. Hidden while a
+    // recording is in flight.
+    in property <bool> wizard-open: false;
+    in-out property <string> wizard-title: "";
+    in-out property <[string]> mic-source-names;
+    in-out property <int> mic-selected-index: 0;
+    in-out property <[string]> monitor-source-names;
+    in-out property <int> monitor-selected-index: 0;
+    in property <string> store-root-display: "";
+
     callback start-clicked();
     callback stop-clicked();
+    callback begin-clicked();
+    callback cancel-wizard-clicked();
 
     VerticalBox {
         HorizontalBox {
@@ -41,6 +55,42 @@ export component AppWindow inherits Window {
                 text: root.recording-active ? "Recording" : root.status-text;
             }
         }
+
+        // In-place wizard panel: shown only when the user has opened it
+        // and no recording is active. Replaces the transcript area for
+        // the duration of source selection.
+        if root.wizard-open && !root.recording-active: VerticalBox {
+            Text {
+                text: "New recording";
+                font-weight: 700;
+            }
+            LineEdit {
+                placeholder-text: "Title";
+                text <=> root.wizard-title;
+            }
+            Text { text: "Microphone"; }
+            ComboBox {
+                model <=> root.mic-source-names;
+                current-index <=> root.mic-selected-index;
+            }
+            Text { text: "Monitor"; }
+            ComboBox {
+                model <=> root.monitor-source-names;
+                current-index <=> root.monitor-selected-index;
+            }
+            Text { text: "Store root: " + root.store-root-display; }
+            HorizontalBox {
+                Button {
+                    text: "Begin";
+                    clicked => { root.begin-clicked(); }
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => { root.cancel-wizard-clicked(); }
+                }
+            }
+        }
+
         ScrollView {
             VerticalLayout {
                 for row in root.transcript-rows: HorizontalLayout {
@@ -67,3 +117,4 @@ export component AppWindow inherits Window {
         }
     }
 }
+
