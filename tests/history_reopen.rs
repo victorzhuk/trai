@@ -1,33 +1,16 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use trai::capture::source_list::{parse_listing, resolve_defaults};
 use trai::domain::SpeakerTag;
+use trai::history;
 use trai::recording::{Recording, RecordingParams};
 use trai::segmenter::{SegmentEvent, Segmenter, SpeechSpan, FRAME_LEN, SAMPLE_RATE_HZ};
-use trai::store;
 use trai::transcriber::{FakeTranscriber, Transcription};
 use trai::translator::FakeTranslator;
 
 const VAD_THRESHOLD: f32 = 0.5;
 const SILENCE_HOLD_MS: u64 = 200;
 const DURATION_CAP_MS: u64 = 20_000;
-
-// Fixture listing mirroring `pactl list sources` shape: one input and
-// one monitor, the same names the wizard will resolve as defaults.
-const LISTING: &str = "\
-Source #42
-\tState: SUSPENDED
-\tName: alsa_input.usb-mic.mono
-\tDescription: USB Microphone Mono
-\tDriver: PipeWire
-
-Source #62
-\tState: SUSPENDED
-\tName: alsa_output.stereo.monitor
-\tDescription: Monitor of Stereo Output
-\tDriver: PipeWire
-";
 
 fn synthetic_speech_frame(len: usize, phase_start: usize, formants: &[f32]) -> Vec<i16> {
     (phase_start..phase_start + len)
@@ -84,28 +67,16 @@ fn expected_span(samples: &[i16]) -> SpeechSpan {
 }
 
 #[test]
-fn wizard_resolution_path_starts_recording_and_persists_meta_and_segments() {
-    let sources = parse_listing(LISTING);
-    let (mic_idx, monitor_idx) = resolve_defaults(
-        &sources,
-        "alsa_input.usb-mic.mono",
-        "alsa_output.stereo.monitor",
-    );
-    let mic_idx = mic_idx.expect("mic default must resolve to an input");
-    let monitor_idx = monitor_idx.expect("monitor default must resolve to a monitor");
-
-    let mic_source = sources[mic_idx].name.clone();
-    let monitor_source = sources[monitor_idx].name.clone();
-    assert!(mic_source.starts_with("alsa_input."));
-    assert!(monitor_source.ends_with(".monitor"));
-
+fn record_stop_reopen_transcript_matches_captured_lines() {
     let mic_formants = [180.0, 420.0, 900.0, 1800.0, 2600.0];
     let monitor_formants = [220.0, 500.0, 1100.0, 2000.0, 3000.0];
+
     let mic_samples = build_stream_samples(&mic_formants);
     let monitor_samples = build_stream_samples(&monitor_formants);
 
     let mic_span = expected_span(&mic_samples);
     let monitor_span = expected_span(&monitor_samples);
+
     let mic_segment_samples =
         mic_samples[mic_span.start_sample as usize..mic_span.end_sample as usize].to_vec();
     let monitor_segment_samples = monitor_samples
@@ -117,15 +88,15 @@ fn wizard_resolution_path_starts_recording_and_persists_meta_and_segments() {
     let monitor_call = fake.expect_call(monitor_segment_samples);
     let translator = Arc::new(FakeTranslator::new());
 
-    let dir = tempfile::tempdir().unwrap();
-    let store_dir = dir.path().join("session");
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("session");
 
     let params = RecordingParams {
         store_dir: store_dir.clone(),
-        title: "Wizard Standup".to_string(),
-        mic_source,
-        monitor_source,
-        mic_language: None,
+        title: "Reopen Me".to_string(),
+        mic_source: "unused".to_string(),
+        monitor_source: "unused".to_string(),
+        mic_language: Some("en".to_string()),
         monitor_language: None,
         target_language: "en".to_string(),
         vad_threshold: VAD_THRESHOLD,
@@ -147,33 +118,41 @@ fn wizard_resolution_path_starts_recording_and_persists_meta_and_segments() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     mic_call.respond(Transcription {
-        text: "mic said".to_string(),
+        text: "mic said something".to_string(),
         mean_confidence: 0.9,
     });
     monitor_call.respond(Transcription {
-        text: "monitor said".to_string(),
+        text: "monitor said something".to_string(),
         mean_confidence: 0.85,
     });
 
     recording.stop().unwrap();
 
-    let segments = store::read_all(&store_dir.join("segments.jsonl")).unwrap();
-    assert_eq!(segments.len(), 2, "both segments must be persisted");
+    let segments = history::read_transcript(&store_dir).unwrap();
+    assert_eq!(segments.len(), 2, "reopened transcript has both lines");
     assert!(
         segments.windows(2).all(|w| w[0].start_ms <= w[1].start_ms),
-        "segments must be ordered by start_ms"
+        "reopened transcript is ordered by start_ms"
     );
-    assert!(segments
-        .iter()
-        .any(|s| s.speaker_tag == SpeakerTag::Me && s.text == "mic said"));
-    assert!(segments
-        .iter()
-        .any(|s| s.speaker_tag == SpeakerTag::Them && s.text == "monitor said"));
 
-    let meta: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(store_dir.join("meta.json")).unwrap())
-            .unwrap();
-    assert_eq!(meta["title"], "Wizard Standup");
-    assert_eq!(meta["mic_source"], "alsa_input.usb-mic.mono");
-    assert_eq!(meta["monitor_source"], "alsa_output.stereo.monitor");
+    let mic_segment = segments
+        .iter()
+        .find(|s| s.speaker_tag == SpeakerTag::Me)
+        .expect("mic segment present and tagged Me");
+    assert_eq!(mic_segment.text, "mic said something");
+
+    let monitor_segment = segments
+        .iter()
+        .find(|s| s.speaker_tag == SpeakerTag::Them)
+        .expect("monitor segment present and tagged Them");
+    assert_eq!(monitor_segment.text, "monitor said something");
+
+    let entries = history::list_recordings(root.path()).unwrap();
+    assert_eq!(entries.len(), 1, "recording is listable right after stop");
+    assert_eq!(entries[0].title, "Reopen Me");
+    assert_eq!(entries[0].line_count, 2);
+    assert!(
+        entries[0].duration_secs.is_some(),
+        "listing carries duration_secs after stop"
+    );
 }

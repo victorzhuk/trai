@@ -6,7 +6,7 @@ use std::path::Path;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum Record {
+pub enum Record {
     Segment(Segment),
     Translation {
         segment_id: u64,
@@ -30,7 +30,7 @@ impl Store {
         self.append_record(&Record::Segment(segment.clone()))
     }
 
-    pub(crate) fn append_record(&mut self, record: &Record) -> io::Result<()> {
+    pub fn append_record(&mut self, record: &Record) -> io::Result<()> {
         let line = serde_json::to_string(record).map_err(io::Error::other)?;
         self.writer.write_all(line.as_bytes())?;
         self.writer.write_all(b"\n")?;

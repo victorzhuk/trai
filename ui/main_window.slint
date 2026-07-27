@@ -14,6 +14,13 @@ export struct TranscriptRow {
     error: bool,
 }
 
+export struct HistoryRow {
+    title: string,
+    date: string,
+    duration: string,
+    line-count: int,
+}
+
 export component AppWindow inherits Window {
     title: "trai";
     preferred-width: 600px;
@@ -34,10 +41,25 @@ export component AppWindow inherits Window {
     in-out property <int> monitor-selected-index: 0;
     in property <string> store-root-display: "";
 
+    // History list + replay state. The list is shown when no recording
+    // is active and the wizard is closed and nothing is being replayed.
+    // `replay-open` flips the transcript area into read-only replay of
+    // a stored recording; `replay-title` is the heading shown above it.
+    in property <[HistoryRow]> history-rows;
+    in property <bool> replay-open: false;
+    in property <string> replay-title: "";
+    in property <bool> delete-confirmation-open: false;
+    in property <string> delete-target-name: "";
+
     callback start-clicked();
     callback stop-clicked();
     callback begin-clicked();
     callback cancel-wizard-clicked();
+    callback history-clicked(int);
+    callback replay-back-clicked();
+    callback delete-clicked();
+    callback confirm-delete-clicked();
+    callback cancel-delete-clicked();
 
     VerticalBox {
         HorizontalBox {
@@ -91,7 +113,8 @@ export component AppWindow inherits Window {
             }
         }
 
-        ScrollView {
+        // Live transcript, only while a recording is in flight.
+        if root.recording-active: ScrollView {
             VerticalLayout {
                 for row in root.transcript-rows: HorizontalLayout {
                     padding-left: 8px;
@@ -112,6 +135,107 @@ export component AppWindow inherits Window {
                         min-width: 0px;
                         color: row.error ? red : row.degraded ? #b45309 : black;
                     }
+                }
+            }
+        }
+
+        // Replay of a stored recording. Same transcript row layout as
+        // the live view, fed from history::read_transcript so degraded
+        // marks appear as they did live. No capture is started here;
+        // Back returns to the list, Delete opens the confirmation.
+        if !root.wizard-open && !root.recording-active && root.replay-open: VerticalBox {
+            HorizontalBox {
+                Text {
+                    text: root.replay-title;
+                    font-weight: 700;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Back";
+                    clicked => { root.replay-back-clicked(); }
+                }
+                Button {
+                    text: "Delete";
+                    clicked => { root.delete-clicked(); }
+                }
+            }
+            ScrollView {
+                VerticalLayout {
+                    for row in root.transcript-rows: HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 12px;
+                        Text { text: row.speaker; min-width: 42px; max-width: 42px; }
+                        Text { text: row.timestamp; min-width: 48px; max-width: 48px; }
+                        Text { text: row.text; horizontal-stretch: 1; min-width: 0px; }
+                        Text {
+                            text: row.error ? "✕" : row.degraded ? "⚠" : "";
+                            min-width: 18px;
+                            max-width: 18px;
+                            color: row.error ? red : row.degraded ? #b45309 : black;
+                        }
+                        Text {
+                            text: row.translation;
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+                            color: row.error ? red : row.degraded ? #b45309 : black;
+                        }
+                    }
+                }
+            }
+        }
+
+        // History list, shown when idle: newest first, click a row to
+        // replay that recording.
+        if !root.wizard-open && !root.recording-active && !root.replay-open: VerticalBox {
+            Text {
+                text: "History";
+                font-weight: 700;
+            }
+            ScrollView {
+                VerticalLayout {
+                    for row[index] in root.history-rows: Rectangle {
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 12px;
+                            Text {
+                                text: row.title;
+                                horizontal-stretch: 1;
+                                min-width: 0px;
+                            }
+                            Text { text: row.date; min-width: 96px; max-width: 96px; }
+                            Text { text: row.duration; min-width: 48px; max-width: 48px; }
+                            Text {
+                                text: row.line-count;
+                                min-width: 36px;
+                                max-width: 36px;
+                            }
+                        }
+                        TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.history-clicked(index); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Delete confirmation overlay; names the recording being
+        // removed and wipes its transcript + audio on confirm.
+        if root.delete-confirmation-open: VerticalBox {
+            Text {
+                text: "Delete \"" + root.delete-target-name + "\"? This removes its transcript and audio.";
+            }
+            HorizontalBox {
+                Button {
+                    text: "Delete";
+                    clicked => { root.confirm-delete-clicked(); }
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => { root.cancel-delete-clicked(); }
                 }
             }
         }

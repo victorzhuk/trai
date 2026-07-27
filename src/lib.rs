@@ -2,6 +2,7 @@ pub mod capture;
 pub mod confidence;
 pub mod config;
 pub mod domain;
+pub mod history;
 pub mod pipeline;
 pub mod recording;
 pub mod segmenter;

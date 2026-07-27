@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,7 @@ use slint::{Model, ModelRc, VecModel};
 use trai::capture::source_list::{enumerate, resolve_defaults, SourceKind};
 use trai::config::{Config, TranslateBackendConfig};
 use trai::domain::Segment;
+use trai::history;
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
 use trai::transcript::{build_rows, TranscriptRow as UiTranscriptRow};
@@ -86,10 +87,49 @@ fn make_transcript_updater(
     }
 }
 
+// Rebuilds the history list model from the store root and hands it to
+// the window on the UI thread. Called on startup, after a recording
+// stops, and whenever the list is returned to. `list_recordings` does
+// filesystem I/O; for a small store root this is acceptable inline,
+// matching the enumerate() call in on_start_clicked.
+fn refresh_history_rows(store_root: &Path, window_weak: slint::Weak<AppWindow>) {
+    let rows: Vec<HistoryRow> = match history::list_recordings(store_root) {
+        Ok(entries) => entries
+            .iter()
+            .map(|entry| HistoryRow {
+                title: entry.title.clone().into(),
+                date: format_timestamp(entry.start_time).into(),
+                duration: match entry.duration_secs {
+                    Some(d) => format!("{}:{:02}", d / 60, d % 60).into(),
+                    None => "—".into(),
+                },
+                line_count: entry.line_count as i32,
+            })
+            .collect(),
+        Err(e) => {
+            let msg = format!("history list failed: {e}");
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = window_weak.upgrade() {
+                    w.set_status_text(msg.into());
+                }
+            });
+            return;
+        }
+    };
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = window_weak.upgrade() {
+            w.set_history_rows(ModelRc::new(VecModel::from(rows)));
+        }
+    });
+}
+
 fn run(config: Config) -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
 
     let recording: Rc<RefCell<Option<Recording>>> = Rc::new(RefCell::new(None));
+    // Dir of the recording currently open in the replay view, so the
+    // delete handler can wipe it without re-resolving from the index.
+    let replay_target: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
 
     // Captured by value so the handlers stay `FnMut` and can be invoked
     // for each new Recording without borrowing `config`.
@@ -244,6 +284,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 monitor_source,
                 mic_language: cfg_mic_language.clone(),
                 monitor_language: cfg_monitor_language.clone(),
+                target_language: cfg_target_language.clone(),
                 vad_threshold: cfg_vad_threshold,
                 silence_hold_ms: cfg_silence_hold_ms,
                 duration_cap_ms: cfg_duration_cap_ms,
@@ -298,6 +339,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     {
         let recording_slot = recording.clone();
         let window_weak = window.as_weak();
+        let cfg_store_root = cfg_store_root.clone();
         window.on_stop_clicked(move || {
             let Some(recording) = recording_slot.borrow_mut().take() else {
                 return;
@@ -305,8 +347,11 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             // stop() joins both reader threads and every outstanding
             // submission thread, so it can block for the tail of an
             // in-flight transcription; run it off the UI thread and
-            // flip the active flag back from the event loop.
+            // flip the active flag back from the event loop. Refresh
+            // the history list in the same callback so the recording
+            // that just stopped lands at the top of the list.
             let window_weak = window_weak.clone();
+            let cfg_store_root = cfg_store_root.clone();
             std::thread::spawn(move || {
                 if let Err(e) = recording.stop() {
                     eprintln!("recording stop failed: {e}");
@@ -316,10 +361,123 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                     if let Some(w) = window_weak.upgrade() {
                         w.set_recording_active(false);
                     }
+                    refresh_history_rows(&cfg_store_root, window_weak);
                 });
             });
         });
     }
+
+    {
+        let replay_target = replay_target.clone();
+        let window_weak = window.as_weak();
+        let cfg_store_root = cfg_store_root.clone();
+        window.on_history_clicked(move |index| {
+            let w = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            // Resolve the clicked row's directory from the current
+            // listing; the index is only valid against a fresh read
+            // since the list could have changed between renders.
+            let entries = match history::list_recordings(&cfg_store_root) {
+                Ok(e) => e,
+                Err(e) => {
+                    w.set_status_text(format!("history list failed: {e}").into());
+                    return;
+                }
+            };
+            let entry = match usize::try_from(index).ok().and_then(|i| entries.get(i)) {
+                Some(e) => e,
+                None => return,
+            };
+            let dir = entry.dir.clone();
+            let segments = match history::read_transcript(&dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    w.set_status_text(format!("read transcript failed: {e}").into());
+                    return;
+                }
+            };
+            // Same row mapping as make_transcript_updater: replay
+            // reuses build_rows so degraded/error marks match the
+            // live view.
+            let rows: Vec<TranscriptRow> = build_rows(&segments)
+                .into_iter()
+                .map(|row: UiTranscriptRow| TranscriptRow {
+                    speaker: row.speaker.into(),
+                    timestamp: row.timestamp.into(),
+                    text: row.text.into(),
+                    translation: row.translation.into(),
+                    degraded: row.degraded,
+                    error: row.error,
+                })
+                .collect();
+            w.set_transcript_rows(ModelRc::new(VecModel::from(rows)));
+            w.set_replay_title(entry.title.clone().into());
+            w.set_replay_open(true);
+            *replay_target.borrow_mut() = Some(dir);
+        });
+    }
+
+    {
+        let replay_target = replay_target.clone();
+        let window_weak = window.as_weak();
+        let cfg_store_root = cfg_store_root.clone();
+        window.on_replay_back_clicked(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_replay_open(false);
+                w.set_replay_title("".into());
+                w.set_transcript_rows(ModelRc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+            }
+            *replay_target.borrow_mut() = None;
+            refresh_history_rows(&cfg_store_root, window_weak.clone());
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        window.on_delete_clicked(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_delete_target_name(w.get_replay_title());
+                w.set_delete_confirmation_open(true);
+            }
+        });
+    }
+
+    {
+        let replay_target = replay_target.clone();
+        let window_weak = window.as_weak();
+        let cfg_store_root = cfg_store_root.clone();
+        window.on_confirm_delete_clicked(move || {
+            let w = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let dir = replay_target.borrow_mut().take();
+            if let Some(dir) = dir {
+                if let Err(e) = history::delete_recording(&dir) {
+                    w.set_status_text(format!("delete failed: {e}").into());
+                }
+            }
+            w.set_replay_open(false);
+            w.set_delete_confirmation_open(false);
+            w.set_replay_title("".into());
+            w.set_transcript_rows(ModelRc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+            refresh_history_rows(&cfg_store_root, window_weak.clone());
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        window.on_cancel_delete_clicked(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_delete_confirmation_open(false);
+            }
+        });
+    }
+
+    // Seed the list so it shows on startup.
+    refresh_history_rows(&cfg_store_root, window.as_weak());
 
     window.run()
 }

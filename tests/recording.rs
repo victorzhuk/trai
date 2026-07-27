@@ -102,6 +102,7 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
         monitor_source: "unused".to_string(),
         mic_language: Some("en".to_string()),
         monitor_language: None,
+        target_language: "en".to_string(),
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
@@ -277,6 +278,7 @@ fn an_open_earlier_span_blocks_flush_of_a_later_span_that_transcribes_first() {
         monitor_source: "unused".to_string(),
         mic_language: None,
         monitor_language: None,
+        target_language: "en".to_string(),
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
@@ -383,6 +385,7 @@ fn meta_json_is_written_at_start_with_title_and_source_names() {
         monitor_source: "alsa_output.stereo.monitor".to_string(),
         mic_language: None,
         monitor_language: None,
+        target_language: "en".to_string(),
         vad_threshold: VAD_THRESHOLD,
         silence_hold_ms: SILENCE_HOLD_MS,
         duration_cap_ms: DURATION_CAP_MS,
@@ -423,4 +426,13 @@ fn meta_json_is_written_at_start_with_title_and_source_names() {
     assert_eq!(meta["title"], "Standup");
     assert_eq!(meta["mic_source"], "alsa_input.usb-mic");
     assert_eq!(meta["monitor_source"], "alsa_output.stereo.monitor");
+    assert!(
+        meta["start_time"].as_u64().is_some(),
+        "stop-written meta must carry start_time"
+    );
+    assert_eq!(meta["target_language"], "en");
+    assert!(
+        meta["duration_secs"].as_u64().is_some(),
+        "stop-written meta must carry duration_secs"
+    );
 }

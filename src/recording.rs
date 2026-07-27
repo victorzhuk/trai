@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::capture::pw_record;
 use crate::capture::tee_pcm_to_wav;
@@ -22,17 +23,22 @@ pub struct RecordingParams {
     pub monitor_source: String,
     pub mic_language: Option<String>,
     pub monitor_language: Option<String>,
+    pub target_language: String,
     pub vad_threshold: f32,
     pub silence_hold_ms: u64,
     pub duration_cap_ms: u64,
     pub confidence_floor: f32,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct RecordingMeta {
     title: String,
     mic_source: String,
     monitor_source: String,
+    start_time: u64,
+    target_language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_secs: Option<u64>,
 }
 
 pub struct Recording {
@@ -42,6 +48,9 @@ pub struct Recording {
     monitor_reader: JoinHandle<io::Result<()>>,
     submissions: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pipeline: Arc<Pipeline>,
+    store_dir: PathBuf,
+    start: Instant,
+    meta: RecordingMeta,
 }
 
 impl Recording {
@@ -104,12 +113,21 @@ impl Recording {
     {
         fs::create_dir_all(&params.store_dir)?;
 
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let start = Instant::now();
+
         // Written at start, not stop, so a mid-meeting crash still
         // leaves the recording self-describing on disk.
         let meta = RecordingMeta {
             title: params.title.clone(),
             mic_source: params.mic_source.clone(),
             monitor_source: params.monitor_source.clone(),
+            start_time,
+            target_language: params.target_language.clone(),
+            duration_secs: None,
         };
         let meta_json = serde_json::to_string_pretty(&meta).map_err(io::Error::other)?;
         fs::write(params.store_dir.join("meta.json"), meta_json)?;
@@ -175,6 +193,9 @@ impl Recording {
             monitor_reader,
             submissions,
             pipeline,
+            store_dir: params.store_dir,
+            start,
+            meta,
         })
     }
 
@@ -201,6 +222,11 @@ impl Recording {
 
         mic_result?;
         monitor_result?;
+
+        self.meta.duration_secs = Some(self.start.elapsed().as_secs());
+        let meta_json = serde_json::to_string_pretty(&self.meta).map_err(io::Error::other)?;
+        fs::write(self.store_dir.join("meta.json"), meta_json)?;
+
         Ok(())
     }
 }
