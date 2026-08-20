@@ -1,9 +1,10 @@
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -89,12 +90,76 @@ fn write_meta(path: &Path, meta: &RecordingMeta) -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", path.display())))
 }
 
+// Segment submissions block on the transcription backend, so a small
+// fixed worker set drains the queue: a slow or dead backend piles up
+// queue entries (bounded by the configured whisper timeout) instead of
+// one 8MB-stack thread per Segment.
+const SUBMISSION_WORKERS: usize = 4;
+
+// Multi-consumer queue: std mpsc Receiver is not Sync, and locking it
+// would let only one worker wait on recv at a time.
+struct SubmissionQueue {
+    inner: Mutex<SubmissionQueueInner>,
+    cvar: Condvar,
+}
+
+#[derive(Default)]
+struct SubmissionQueueInner {
+    queue: VecDeque<SegmentInput>,
+    closed: bool,
+}
+
+impl SubmissionQueue {
+    fn push(&self, input: SegmentInput) {
+        self.inner
+            .lock()
+            .expect("submission queue mutex poisoned")
+            .queue
+            .push_back(input);
+        self.cvar.notify_one();
+    }
+
+    // Buffered jobs still drain after close; None means closed AND empty.
+    fn pop(&self) -> Option<SegmentInput> {
+        let mut inner = self.inner.lock().expect("submission queue mutex poisoned");
+        loop {
+            if let Some(input) = inner.queue.pop_front() {
+                return Some(input);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self
+                .cvar
+                .wait(inner)
+                .expect("submission queue mutex poisoned");
+        }
+    }
+
+    fn close(&self) {
+        self.inner
+            .lock()
+            .expect("submission queue mutex poisoned")
+            .closed = true;
+        self.cvar.notify_all();
+    }
+
+    fn pending(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("submission queue mutex poisoned")
+            .queue
+            .len()
+    }
+}
+
 pub struct Recording {
     mic_child: Option<Child>,
     monitor_child: Option<Child>,
     mic_reader: JoinHandle<io::Result<()>>,
     monitor_reader: JoinHandle<io::Result<()>>,
-    submissions: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    submissions: Arc<SubmissionQueue>,
+    submission_workers: Vec<JoinHandle<()>>,
     pipeline: Arc<Pipeline>,
     store_dir: PathBuf,
     start: Instant,
@@ -242,7 +307,23 @@ impl Recording {
         let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))
             .map_err(|e| io::Error::new(e.kind(), format!("create monitor.wav: {e}")))?;
 
-        let submissions: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let submissions = Arc::new(SubmissionQueue {
+            inner: Mutex::new(SubmissionQueueInner::default()),
+            cvar: Condvar::new(),
+        });
+        let submission_workers = (0..SUBMISSION_WORKERS)
+            .map(|_| {
+                let pipeline = pipeline.clone();
+                let submissions = submissions.clone();
+                thread::spawn(move || {
+                    while let Some(input) = submissions.pop() {
+                        if let Err(e) = pipeline.finish_pending(input) {
+                            crate::debug!("segment submission failed: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
 
         let mic_reader = {
             let pipeline = pipeline.clone();
@@ -288,6 +369,7 @@ impl Recording {
             mic_reader,
             monitor_reader,
             submissions,
+            submission_workers,
             pipeline,
             store_dir: params.store_dir,
             start,
@@ -332,16 +414,15 @@ impl Recording {
         );
 
         let at_submissions = Instant::now();
-        let handles =
-            std::mem::take(&mut *self.submissions.lock().expect("submissions mutex poisoned"));
-        let pending = handles.len();
-        for handle in handles {
+        let pending = self.submissions.pending();
+        self.submissions.close();
+        for handle in self.submission_workers {
             handle
                 .join()
-                .map_err(|_| io::Error::other("segment submission thread panicked"))?;
+                .map_err(|_| io::Error::other("segment submission worker panicked"))?;
         }
         crate::debug!(
-            "stop: {pending} submissions joined in {:.2}s",
+            "stop: {pending} queued submissions drained in {:.2}s",
             at_submissions.elapsed().as_secs_f64()
         );
 
@@ -381,7 +462,7 @@ fn run_reader<R: io::Read>(
     mut wav: WavWriter,
     params: ReaderParams,
     pipeline: Arc<Pipeline>,
-    submissions: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    submissions: Arc<SubmissionQueue>,
 ) -> io::Result<()> {
     let ReaderParams {
         speaker_tag,
@@ -440,7 +521,6 @@ fn run_reader<R: io::Read>(
                         span.end_sample - span.start_sample,
                     );
                     spawn_submission(
-                        &pipeline,
                         &submissions,
                         speaker_tag,
                         language.clone(),
@@ -462,15 +542,7 @@ fn run_reader<R: io::Read>(
         // Its Opened event already fired earlier, when this trailing
         // span first opened mid-stream -- no begin() call needed here.
         segments_closed += 1;
-        spawn_submission(
-            &pipeline,
-            &submissions,
-            speaker_tag,
-            language,
-            &buffer,
-            span,
-            drained,
-        );
+        spawn_submission(&submissions, speaker_tag, language, &buffer, span, drained);
     }
 
     crate::debug!(
@@ -498,8 +570,7 @@ fn drain_dead_prefix(buffer: &mut Vec<i16>, drained: &mut u64, floor: u64) {
 }
 
 fn spawn_submission(
-    pipeline: &Arc<Pipeline>,
-    submissions: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+    submissions: &Arc<SubmissionQueue>,
     speaker_tag: SpeakerTag,
     language: Option<String>,
     buffer: &[i16],
@@ -509,27 +580,14 @@ fn spawn_submission(
     let start = (span.start_sample - drained) as usize;
     let end = (span.end_sample - drained) as usize;
     let samples = buffer[start..end].to_vec();
-    let start_ms = segmenter::to_ms(span.start_sample);
-    let end_ms = segmenter::to_ms(span.end_sample);
-    let pipeline = pipeline.clone();
 
-    let handle = thread::spawn(move || {
-        let input = SegmentInput {
-            speaker_tag,
-            start_ms,
-            end_ms,
-            samples,
-            language,
-        };
-        if let Err(e) = pipeline.finish_pending(input) {
-            crate::debug!("segment submission failed: {e}");
-        }
+    submissions.push(SegmentInput {
+        speaker_tag,
+        start_ms: segmenter::to_ms(span.start_sample),
+        end_ms: segmenter::to_ms(span.end_sample),
+        samples,
+        language,
     });
-
-    submissions
-        .lock()
-        .expect("submissions mutex poisoned")
-        .push(handle);
 }
 
 #[cfg(test)]

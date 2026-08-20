@@ -552,20 +552,35 @@ fn recording_drains_dead_audio_without_corrupting_later_segments() {
     )
     .unwrap();
 
-    wait_until(|| fake.pending_count() == 0);
+    // More expectations than submission workers: the queued job's
+    // transcribe call only starts once a worker frees, so responses
+    // must flow while we wait. Each responder thread's rendezvous send
+    // blocks until its matching transcribe call arrives.
+    let responders: Vec<_> = mic_calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, call)| {
+            std::thread::spawn(move || {
+                call.respond(Transcription {
+                    text: format!("mic span {i}"),
+                    mean_confidence: 0.9,
+                    language: None,
+                });
+            })
+        })
+        .chain(std::iter::once(std::thread::spawn(move || {
+            monitor_call.respond(Transcription {
+                text: "monitor said something".to_string(),
+                mean_confidence: 0.85,
+                language: None,
+            });
+        })))
+        .collect();
 
-    for (i, call) in mic_calls.into_iter().enumerate() {
-        call.respond(Transcription {
-            text: format!("mic span {i}"),
-            mean_confidence: 0.9,
-            language: None,
-        });
+    wait_until(|| fake.pending_count() == 0);
+    for responder in responders {
+        responder.join().unwrap();
     }
-    monitor_call.respond(Transcription {
-        text: "monitor said something".to_string(),
-        mean_confidence: 0.85,
-        language: None,
-    });
 
     recording.stop().unwrap();
 
