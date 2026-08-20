@@ -153,9 +153,74 @@ impl SubmissionQueue {
     }
 }
 
+/// Owns the two pw-record child processes feeding a Recording, so the
+/// capture lifecycle (spawn both, kill both) lives at the process edge
+/// and the library core works with plain readers.
+struct Capture {
+    mic_child: Child,
+    monitor_child: Child,
+}
+
+impl Capture {
+    fn spawn(
+        mic_source: &str,
+        monitor_source: &str,
+    ) -> io::Result<(Self, std::process::ChildStdout, std::process::ChildStdout)> {
+        let mut mic_child = pw_record::spawn(mic_source).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("spawn pw-record for mic source '{mic_source}': {e}"),
+            )
+        })?;
+        let mic_stdout = mic_child
+            .stdout
+            .take()
+            .expect("pw-record spawned with piped stdout");
+
+        let mut monitor_child = match pw_record::spawn(monitor_source) {
+            Ok(child) => child,
+            Err(e) => {
+                if let Err(stop_err) = pw_record::stop(&mut mic_child) {
+                    crate::debug!(
+                        "start: stopping mic pw-record after monitor spawn failed: {stop_err}"
+                    );
+                }
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("spawn pw-record for monitor source '{monitor_source}': {e}"),
+                ));
+            }
+        };
+        let monitor_stdout = monitor_child
+            .stdout
+            .take()
+            .expect("pw-record spawned with piped stdout");
+
+        Ok((
+            Self {
+                mic_child,
+                monitor_child,
+            },
+            mic_stdout,
+            monitor_stdout,
+        ))
+    }
+
+    fn stop(&mut self) -> io::Result<()> {
+        pw_record::stop(&mut self.mic_child)?;
+        pw_record::stop(&mut self.monitor_child)?;
+        Ok(())
+    }
+
+    fn stop_quiet(&mut self) {
+        if let Err(e) = self.stop() {
+            crate::debug!("start: stopping pw-record children after failure: {e}");
+        }
+    }
+}
+
 pub struct Recording {
-    mic_child: Option<Child>,
-    monitor_child: Option<Child>,
+    capture: Option<Capture>,
     mic_reader: JoinHandle<io::Result<()>>,
     monitor_reader: JoinHandle<io::Result<()>>,
     submissions: Arc<SubmissionQueue>,
@@ -187,41 +252,8 @@ impl Recording {
             params.confidence_floor,
         );
 
-        let mut mic_child = pw_record::spawn(&params.mic_source).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "spawn pw-record for mic source '{}': {e}",
-                    params.mic_source
-                ),
-            )
-        })?;
-        let mic_stdout = mic_child
-            .stdout
-            .take()
-            .expect("pw-record spawned with piped stdout");
-
-        let mut monitor_child = match pw_record::spawn(&params.monitor_source) {
-            Ok(child) => child,
-            Err(e) => {
-                if let Err(stop_err) = pw_record::stop(&mut mic_child) {
-                    crate::debug!(
-                        "start: stopping mic pw-record after monitor spawn failed: {stop_err}"
-                    );
-                }
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "spawn pw-record for monitor source '{}': {e}",
-                        params.monitor_source
-                    ),
-                ));
-            }
-        };
-        let monitor_stdout = monitor_child
-            .stdout
-            .take()
-            .expect("pw-record spawned with piped stdout");
+        let (mut capture, mic_stdout, monitor_stdout) =
+            Capture::spawn(&params.mic_source, &params.monitor_source)?;
 
         let mut recording = match Self::start_with_sources(
             mic_stdout,
@@ -233,18 +265,12 @@ impl Recording {
         ) {
             Ok(recording) => recording,
             Err(e) => {
-                if let Err(stop_err) = pw_record::stop(&mut mic_child) {
-                    crate::debug!("start: stopping mic pw-record after failure: {stop_err}");
-                }
-                if let Err(stop_err) = pw_record::stop(&mut monitor_child) {
-                    crate::debug!("start: stopping monitor pw-record after failure: {stop_err}");
-                }
+                capture.stop_quiet();
                 return Err(e);
             }
         };
 
-        recording.mic_child = Some(mic_child);
-        recording.monitor_child = Some(monitor_child);
+        recording.capture = Some(capture);
         Ok(recording)
     }
 
@@ -364,8 +390,7 @@ impl Recording {
         };
 
         Ok(Self {
-            mic_child: None,
-            monitor_child: None,
+            capture: None,
             mic_reader,
             monitor_reader,
             submissions,
@@ -388,11 +413,8 @@ impl Recording {
         // state for the sum of these, so a slow stop needs to name which
         // stage is slow.
         let began = Instant::now();
-        if let Some(mut child) = self.mic_child.take() {
-            pw_record::stop(&mut child)?;
-        }
-        if let Some(mut child) = self.monitor_child.take() {
-            pw_record::stop(&mut child)?;
+        if let Some(mut capture) = self.capture.take() {
+            capture.stop()?;
         }
         crate::debug!(
             "stop: capture killed in {:.2}s",
