@@ -224,6 +224,39 @@ fn configured_language(configured: Option<&str>) -> Option<String> {
     )
 }
 
+/// What the Pipeline needs from persistence: append Segment records in
+/// start_ms order and Translation records whenever they settle, both
+/// durably. `Store` implements it against the filesystem; tests can
+/// substitute an in-memory sink instead of tempdirs or /dev/full.
+pub trait SegmentSink: Send {
+    fn append_segment(&mut self, segment: &Segment) -> std::io::Result<()>;
+    fn append_translation(
+        &mut self,
+        segment_id: u64,
+        text: &str,
+        degraded: bool,
+    ) -> std::io::Result<()>;
+}
+
+impl SegmentSink for Store {
+    fn append_segment(&mut self, segment: &Segment) -> std::io::Result<()> {
+        self.append(segment)
+    }
+
+    fn append_translation(
+        &mut self,
+        segment_id: u64,
+        text: &str,
+        degraded: bool,
+    ) -> std::io::Result<()> {
+        self.append_record(&Record::Translation {
+            segment_id,
+            text: text.to_string(),
+            degraded,
+        })
+    }
+}
+
 /// One change to the live view. Replaces full-snapshot callbacks: a
 /// long meeting would otherwise deep-clone every row on every event
 /// and re-render the whole list for a one-row change.
@@ -253,7 +286,7 @@ pub struct Pipeline {
     // Separate from `persisted` so write+flush+sync_data (an fsync per
     // append, milliseconds on a busy disk) never runs while the live
     // state lock is held. Lock order is always store -> persisted.
-    store: Arc<Mutex<Store>>,
+    store: Arc<Mutex<dyn SegmentSink>>,
     on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
     translation_tx: Sender<TranslationJob>,
     // Queued plus running translation jobs; drain_translations waits on
@@ -273,7 +306,7 @@ impl Pipeline {
     pub fn new(
         transcriber: Arc<dyn Transcriber>,
         translator: Arc<dyn Translator>,
-        store: Store,
+        sink: impl SegmentSink + 'static,
         confidence_floor: f32,
         target_language: impl Into<String>,
     ) -> Self {
@@ -284,7 +317,7 @@ impl Pipeline {
             in_flight: BTreeMap::new(),
             row_index: HashMap::new(),
         }));
-        let store = Arc::new(Mutex::new(store));
+        let store: Arc<Mutex<dyn SegmentSink>> = Arc::new(Mutex::new(sink));
         let on_update = Arc::new(Mutex::new(None));
         let (translation_tx, translation_rx) = channel();
         let translations_in_flight = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -496,7 +529,7 @@ impl Pipeline {
             persisted.take_ready_prefix()
         };
         for segment in &batch {
-            store.append(segment)?;
+            store.append_segment(segment)?;
         }
         Ok(())
     }
@@ -558,7 +591,7 @@ impl Pipeline {
         rx: Receiver<TranslationJob>,
         translator: Arc<dyn Translator>,
         persisted: Arc<Mutex<Persisted>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<Mutex<dyn SegmentSink>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         target_language: String,
         translations_in_flight: Arc<(Mutex<usize>, Condvar)>,
@@ -621,7 +654,7 @@ impl Pipeline {
 
     fn record_translation(
         persisted: Arc<Mutex<Persisted>>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<Mutex<dyn SegmentSink>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         segment_id: u64,
         text: String,
@@ -637,11 +670,7 @@ impl Pipeline {
         // Persisted first, like before, but the fsync now runs under
         // the store lock only (store -> persisted lock order).
         let mut store = store.lock().expect("store mutex poisoned");
-        store.append_record(&Record::Translation {
-            segment_id,
-            text: text.clone(),
-            degraded,
-        })?;
+        store.append_translation(segment_id, &text, degraded)?;
         drop(store);
 
         Self::mutate_row(persisted, on_update, segment_id, |row| {
@@ -710,8 +739,6 @@ mod tests {
     use crate::transcriber::{FakeTranscriber, Transcription};
     use crate::translator::FakeTranslator;
     use std::fs;
-    #[cfg(target_os = "linux")]
-    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     // Poll a condition instead of sleeping a fixed duration: a 50ms
@@ -1057,13 +1084,36 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    // Always-failing sink: lets the append-failure path be tested on
+    // any platform instead of depending on /dev/full.
+    struct FailingSink;
+
+    impl SegmentSink for FailingSink {
+        fn append_segment(&mut self, _segment: &Segment) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink always fails"))
+        }
+
+        fn append_translation(
+            &mut self,
+            _segment_id: u64,
+            _text: &str,
+            _degraded: bool,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink always fails"))
+        }
+    }
+
     #[test]
     fn record_translation_leaves_live_view_pending_when_append_fails() {
-        let store = Store::open(Path::new("/dev/full")).unwrap();
         let transcriber = Arc::new(FakeTranscriber::new());
         let translator = Arc::new(FakeTranslator::new());
-        let pipeline = Arc::new(Pipeline::new(transcriber, translator, store, 0.0, "en"));
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber,
+            translator,
+            FailingSink,
+            0.0,
+            "en",
+        ));
 
         pipeline
             .persisted
