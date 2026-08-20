@@ -13,7 +13,9 @@ use trai::history;
 use trai::pipeline::{Pipeline, TranscriptUpdate};
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
-use trai::transcript::{build_row, summarize, TranscriptRow as UiTranscriptRow};
+use trai::transcript::{
+    build_row, summarize, OriginalText, TranscriptRow as UiTranscriptRow, TranslationText,
+};
 use trai::translator::{FallbackTranslator, OpenAITranslator, Translator};
 
 slint::include_modules!();
@@ -81,20 +83,39 @@ fn transcript_model() -> Rc<VecModel<TranscriptRow>> {
     })
 }
 
+// Flattened into the slint row at the boundary: the library speaks in
+// state enums, the UI in its own bool fields.
+const PENDING: &str = "…";
+const NO_TRANSLATION: &str = "—";
+
 fn to_ui_row(segment: &Segment, target_language: &str) -> TranscriptRow {
     let row: UiTranscriptRow = build_row(segment, target_language);
+
+    let (text, transcribing, text_failed) = match row.original {
+        OriginalText::Transcribing => (PENDING.to_string(), true, false),
+        OriginalText::Failed(message) => (message, false, true),
+        OriginalText::Ready(text) => (text, false, false),
+    };
+    let (translation, pending, verbatim, degraded, error) = match row.translation {
+        TranslationText::Pending => (PENDING.to_string(), true, false, false, false),
+        TranslationText::Ready { text, degraded } => (text, false, false, degraded, false),
+        TranslationText::Verbatim(text) => (text, false, true, false, false),
+        TranslationText::Failed(message) => (message, false, false, false, true),
+        TranslationText::Absent => (NO_TRANSLATION.to_string(), false, false, false, false),
+    };
+
     TranscriptRow {
         speaker: row.speaker.into(),
         mine: row.mine,
         timestamp: row.timestamp.into(),
-        text: row.text.into(),
-        translation: row.translation.into(),
-        transcribing: row.transcribing,
-        text_failed: row.text_failed,
-        pending: row.pending,
-        verbatim: row.verbatim,
-        degraded: row.degraded,
-        error: row.error,
+        text: text.into(),
+        translation: translation.into(),
+        transcribing,
+        text_failed,
+        pending,
+        verbatim,
+        degraded,
+        error,
     }
 }
 

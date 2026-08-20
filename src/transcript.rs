@@ -1,21 +1,32 @@
 use crate::domain::{Segment, SegmentState, SpeakerTag};
 
-const PENDING: &str = "…";
-const NO_TRANSLATION: &str = "—";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginalText {
+    Transcribing,
+    Failed(String),
+    Ready(String),
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationText {
+    Pending,
+    Ready { text: String, degraded: bool },
+    Verbatim(String),
+    Failed(String),
+    // The transcription failed, so there is nothing to translate.
+    Absent,
+}
+
+// One panel row as two small state machines instead of seven booleans
+// whose invalid combinations (transcribing AND text_failed) were
+// representable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRow {
     pub speaker: String,
     pub mine: bool,
     pub timestamp: String,
-    pub text: String,
-    pub translation: String,
-    pub transcribing: bool,
-    pub text_failed: bool,
-    pub pending: bool,
-    pub verbatim: bool,
-    pub degraded: bool,
-    pub error: bool,
+    pub original: OriginalText,
+    pub translation: TranslationText,
 }
 
 /// Snapshot of what the pipeline is busy with, read off the same
@@ -32,49 +43,38 @@ pub struct TranscriptStatus {
 }
 
 pub fn build_row(segment: &Segment, target_language: &str) -> TranscriptRow {
-    let mut row = TranscriptRow {
+    let original = match &segment.state {
+        SegmentState::Transcribing => OriginalText::Transcribing,
+        SegmentState::Failed(message) => OriginalText::Failed(message.clone()),
+        SegmentState::Ready => OriginalText::Ready(segment.text.clone()),
+    };
+
+    let translation = match &segment.state {
+        SegmentState::Transcribing => TranslationText::Pending,
+        SegmentState::Failed(_) => TranslationText::Absent,
+        SegmentState::Ready => {
+            if let Some(message) = &segment.translation_error {
+                TranslationText::Failed(message.clone())
+            } else if let Some(translation) = &segment.translation {
+                TranslationText::Ready {
+                    text: translation.clone(),
+                    degraded: segment.degraded,
+                }
+            } else if segment.is_target_language(target_language) {
+                TranslationText::Verbatim(segment.text.clone())
+            } else {
+                TranslationText::Pending
+            }
+        }
+    };
+
+    TranscriptRow {
         speaker: speaker_label(segment.speaker_tag).into(),
         mine: segment.speaker_tag == SpeakerTag::Me,
         timestamp: format_timestamp(segment.start_ms),
-        text: segment.text.clone(),
-        translation: PENDING.to_string(),
-        transcribing: false,
-        text_failed: false,
-        pending: true,
-        verbatim: false,
-        degraded: false,
-        error: false,
-    };
-
-    match &segment.state {
-        SegmentState::Transcribing => {
-            row.transcribing = true;
-            row.text = PENDING.to_string();
-        }
-        SegmentState::Failed(message) => {
-            row.text = message.clone();
-            row.text_failed = true;
-            row.translation = NO_TRANSLATION.to_string();
-            row.pending = false;
-        }
-        SegmentState::Ready => {
-            if let Some(message) = &segment.translation_error {
-                row.translation = message.clone();
-                row.pending = false;
-                row.error = true;
-            } else if let Some(translation) = &segment.translation {
-                row.translation = translation.clone();
-                row.pending = false;
-                row.degraded = segment.degraded;
-            } else if segment.is_target_language(target_language) {
-                row.translation = segment.text.clone();
-                row.pending = false;
-                row.verbatim = true;
-            }
-        }
+        original,
+        translation,
     }
-
-    row
 }
 
 pub fn build_rows(segments: &[Segment], target_language: &str) -> Vec<TranscriptRow> {
@@ -212,16 +212,16 @@ mod tests {
         assert_eq!(rows[0].speaker, "me");
         assert!(rows[0].mine);
         assert_eq!(rows[0].timestamp, "00:00");
-        assert_eq!(rows[0].translation, "…");
-        assert!(rows[0].pending);
-        assert!(!rows[0].degraded);
-        assert!(!rows[0].error);
+        assert_eq!(rows[0].translation, TranslationText::Pending);
         assert_eq!(rows[1].speaker, "them");
         assert!(!rows[1].mine);
-        assert_eq!(rows[1].translation, "bonjour");
-        assert!(!rows[1].pending);
-        assert!(!rows[1].degraded);
-        assert!(!rows[1].error);
+        assert_eq!(
+            rows[1].translation,
+            TranslationText::Ready {
+                text: "bonjour".to_string(),
+                degraded: false,
+            }
+        );
     }
 
     #[test]
@@ -235,13 +235,17 @@ mod tests {
         let normal_rows = build_rows(&[normal], "en");
         let degraded_rows = build_rows(&[degraded], "en");
 
-        assert_eq!(degraded_rows[0].translation, "bonjour");
-        assert!(degraded_rows[0].degraded);
-        assert!(!degraded_rows[0].error);
+        assert_eq!(
+            degraded_rows[0].translation,
+            TranslationText::Ready {
+                text: "bonjour".to_string(),
+                degraded: true,
+            }
+        );
 
         assert_eq!(normal_rows[0].speaker, degraded_rows[0].speaker);
         assert_eq!(normal_rows[0].timestamp, degraded_rows[0].timestamp);
-        assert_eq!(normal_rows[0].text, degraded_rows[0].text);
+        assert_eq!(normal_rows[0].original, degraded_rows[0].original);
     }
 
     #[test]
@@ -255,13 +259,14 @@ mod tests {
         let normal_rows = build_rows(&[normal], "en");
         let error_rows = build_rows(&[errored], "en");
 
-        assert_eq!(error_rows[0].translation, "model 'x' not found");
-        assert!(error_rows[0].error);
-        assert!(!error_rows[0].degraded);
+        assert_eq!(
+            error_rows[0].translation,
+            TranslationText::Failed("model 'x' not found".to_string())
+        );
 
         assert_eq!(normal_rows[0].speaker, error_rows[0].speaker);
         assert_eq!(normal_rows[0].timestamp, error_rows[0].timestamp);
-        assert_eq!(normal_rows[0].text, error_rows[0].text);
+        assert_eq!(normal_rows[0].original, error_rows[0].original);
     }
 
     #[test]
@@ -280,8 +285,14 @@ mod tests {
         assert_eq!(before_rows.len(), after_rows.len());
         assert_eq!(before_rows[0], after_rows[0]);
         assert_eq!(before_rows[2], after_rows[2]);
-        assert_eq!(before_rows[1].translation, "…");
-        assert_eq!(after_rows[1].translation, "trad");
+        assert_eq!(before_rows[1].translation, TranslationText::Pending);
+        assert_eq!(
+            after_rows[1].translation,
+            TranslationText::Ready {
+                text: "trad".to_string(),
+                degraded: false,
+            }
+        );
         assert_ne!(before_rows[1], after_rows[1]);
     }
 
@@ -293,17 +304,15 @@ mod tests {
 
         let rows = build_rows(&[segment.clone()], "ru");
 
-        assert_eq!(rows[0].translation, "уже по-русски");
-        assert!(rows[0].verbatim);
-        assert!(!rows[0].pending);
-        assert!(!rows[0].degraded);
-        assert!(!rows[0].error);
+        assert_eq!(
+            rows[0].translation,
+            TranslationText::Verbatim("уже по-русски".to_string())
+        );
 
         // The same Segment against another target language is an
         // ordinary line still waiting for its translation.
         let rows = build_rows(&[segment], "en");
-        assert!(!rows[0].verbatim);
-        assert!(rows[0].pending);
+        assert_eq!(rows[0].translation, TranslationText::Pending);
     }
 
     #[test]
@@ -313,8 +322,7 @@ mod tests {
 
         let rows = build_rows(&[segment], "klingon");
 
-        assert!(!rows[0].verbatim);
-        assert!(rows[0].pending);
+        assert_eq!(rows[0].translation, TranslationText::Pending);
     }
 
     #[test]
@@ -328,16 +336,14 @@ mod tests {
 
         let rows = build_rows(&[transcribing, failed], "en");
 
-        assert!(rows[0].transcribing);
-        assert_eq!(rows[0].text, "…");
-        assert!(rows[0].pending, "its translation is pending too");
-        assert!(!rows[0].text_failed);
+        assert_eq!(rows[0].original, OriginalText::Transcribing);
+        assert_eq!(rows[0].translation, TranslationText::Pending);
 
-        assert!(rows[1].text_failed);
-        assert_eq!(rows[1].text, "whisper returned 503");
-        assert_eq!(rows[1].translation, "—");
-        assert!(!rows[1].pending);
-        assert!(!rows[1].transcribing);
+        assert_eq!(
+            rows[1].original,
+            OriginalText::Failed("whisper returned 503".to_string())
+        );
+        assert_eq!(rows[1].translation, TranslationText::Absent);
     }
 
     #[test]
