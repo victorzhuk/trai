@@ -73,7 +73,6 @@ struct Persisted {
     // built on it keeps rows after they've been flushed to disk and
     // dropped from `transcript`.
     live_view: Vec<Segment>,
-    store: Store,
     // start_ms -> count of segments currently between opening (or, for
     // callers with no separate open phase, submitting) and completing
     // their transcribe() call, keyed by start_ms (not id) so
@@ -96,9 +95,14 @@ impl Persisted {
         }
     }
 
-    fn flush_ready_prefix(&mut self) -> Result<(), PipelineError> {
+    // Drains the still-unflushed prefix that is safe to write, without
+    // doing any I/O: the caller appends the returned Segments under the
+    // store lock, after releasing this one, so an fsync never blocks
+    // reader or translation threads touching live state.
+    fn take_ready_prefix(&mut self) -> Vec<Segment> {
         let watermark = self.in_flight.keys().next().copied();
-        while let Some(candidate) = self.transcript.first() {
+        let mut ready = 0;
+        while let Some(candidate) = self.transcript.get(ready) {
             let safe = match watermark {
                 Some(min_in_flight) => candidate.start_ms <= min_in_flight,
                 None => true,
@@ -106,10 +110,9 @@ impl Persisted {
             if !safe {
                 break;
             }
-            self.store.append(candidate)?;
-            self.transcript.remove(0);
+            ready += 1;
         }
-        Ok(())
+        self.transcript.drain(..ready).collect()
     }
 
     // The row was inserted at this Segment's start_ms when it closed and
@@ -200,6 +203,10 @@ pub struct Pipeline {
     target_language: String,
     next_id: AtomicU64,
     persisted: Arc<Mutex<Persisted>>,
+    // Separate from `persisted` so write+flush+sync_data (an fsync per
+    // append, milliseconds on a busy disk) never runs while the live
+    // state lock is held. Lock order is always store -> persisted.
+    store: Arc<Mutex<Store>>,
     on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
     translation_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     translation_chain_tail: Arc<Mutex<Option<Receiver<()>>>>,
@@ -227,9 +234,9 @@ impl Pipeline {
             persisted: Arc::new(Mutex::new(Persisted {
                 transcript: Vec::new(),
                 live_view: Vec::new(),
-                store,
                 in_flight: BTreeMap::new(),
             })),
+            store: Arc::new(Mutex::new(store)),
             on_update: Arc::new(Mutex::new(None)),
             translation_handles: Arc::new(Mutex::new(Vec::new())),
             translation_chain_tail: Arc::new(Mutex::new(None)),
@@ -299,16 +306,16 @@ impl Pipeline {
         let transcription = match outcome {
             Ok(transcription) => transcription,
             Err(e) => {
-                let (snapshot, flushed) = {
+                let snapshot = {
                     let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
                     persisted.retire_in_flight(input.start_ms);
                     persisted.fail_live_row(segment_id, e.to_string());
-                    (persisted.live_view.clone(), persisted.flush_ready_prefix())
+                    persisted.live_view.clone()
                 };
                 // The failed row is worth more on screen than the flush
                 // result is, so it goes out before the error propagates.
                 self.fire_update(snapshot);
-                flushed?;
+                self.flush_ready()?;
                 return Err(e.into());
             }
         };
@@ -368,11 +375,10 @@ impl Pipeline {
                 persisted.drop_live_row(segment_id);
             }
 
-            let snapshot = persisted.live_view.clone();
-            persisted.flush_ready_prefix()?;
-            snapshot
+            persisted.live_view.clone()
         };
 
+        self.flush_ready()?;
         self.fire_update(snapshot);
 
         if let Some((segment_id, text)) = translation_job {
@@ -389,6 +395,21 @@ impl Pipeline {
     pub fn submit(&self, input: SegmentInput) -> Result<(), PipelineError> {
         self.begin(input.start_ms);
         self.finish_pending(input)
+    }
+
+    // Appends every Segment whose watermark gate has opened, in
+    // transcript order. The batch is taken under the persisted lock
+    // (no I/O) and written under the store lock only.
+    fn flush_ready(&self) -> Result<(), PipelineError> {
+        let mut store = self.store.lock().expect("store mutex poisoned");
+        let batch = {
+            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+            persisted.take_ready_prefix()
+        };
+        for segment in &batch {
+            store.append(segment)?;
+        }
+        Ok(())
     }
 
     /// Signals `drain_translations` (or a future caller) to stop
@@ -443,6 +464,7 @@ impl Pipeline {
     fn dispatch_translation(&self, segment_id: u64, text: String) {
         let translator = self.translator.clone();
         let persisted = self.persisted.clone();
+        let store = self.store.clone();
         let on_update = self.on_update.clone();
         let target_language = self.target_language.clone();
 
@@ -483,6 +505,7 @@ impl Pipeline {
                     );
                     if let Err(e) = Self::record_translation(
                         persisted,
+                        store,
                         on_update,
                         segment_id,
                         translation.text,
@@ -520,22 +543,33 @@ impl Pipeline {
 
     fn record_translation(
         persisted: Arc<Mutex<Persisted>>,
+        store: Arc<Mutex<Store>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         segment_id: u64,
         text: String,
         degraded: bool,
     ) -> Result<(), PipelineError> {
-        Self::mutate_row(persisted, on_update, segment_id, |persisted, position| {
-            persisted.store.append_record(&Record::Translation {
-                segment_id,
-                text: text.clone(),
-                degraded,
-            })?;
-            let row = &mut persisted.live_view[position];
+        {
+            let persisted = persisted.lock().expect("pipeline mutex poisoned");
+            if !persisted.live_view.iter().any(|s| s.id == segment_id) {
+                return Ok(());
+            }
+        }
+
+        // Persisted first, like before, but the fsync now runs under
+        // the store lock only (store -> persisted lock order).
+        let mut store = store.lock().expect("store mutex poisoned");
+        store.append_record(&Record::Translation {
+            segment_id,
+            text: text.clone(),
+            degraded,
+        })?;
+        drop(store);
+
+        Self::mutate_row(persisted, on_update, segment_id, |row| {
             row.translation = Some(text);
             row.degraded = degraded;
             row.translation_error = None;
-            Ok(())
         })
     }
 
@@ -545,9 +579,8 @@ impl Pipeline {
         segment_id: u64,
         message: String,
     ) -> Result<(), PipelineError> {
-        Self::mutate_row(persisted, on_update, segment_id, |persisted, position| {
-            persisted.live_view[position].translation_error = Some(message);
-            Ok(())
+        Self::mutate_row(persisted, on_update, segment_id, |row| {
+            row.translation_error = Some(message);
         })
     }
 
@@ -558,19 +591,19 @@ impl Pipeline {
         persisted: Arc<Mutex<Persisted>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         segment_id: u64,
-        mutate: impl FnOnce(&mut Persisted, usize) -> Result<(), PipelineError>,
+        mutate: impl FnOnce(&mut Segment),
     ) -> Result<(), PipelineError> {
         let snapshot = {
             let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
-            let Some(position) = persisted
+            let Some(row) = persisted
                 .live_view
-                .iter()
-                .position(|segment| segment.id == segment_id)
+                .iter_mut()
+                .find(|segment| segment.id == segment_id)
             else {
                 return Ok(());
             };
 
-            mutate(&mut persisted, position)?;
+            mutate(row);
             persisted.live_view.clone()
         };
 
@@ -835,6 +868,7 @@ mod tests {
 
         Pipeline::record_translation(
             pipeline.persisted.clone(),
+            pipeline.store.clone(),
             on_update.clone(),
             123,
             "ignored".to_string(),
@@ -967,6 +1001,7 @@ mod tests {
 
         let err = Pipeline::record_translation(
             pipeline.persisted.clone(),
+            pipeline.store.clone(),
             on_update,
             1,
             "t1".to_string(),
