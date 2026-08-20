@@ -32,6 +32,15 @@ impl FakeTranscriber {
             .insert(samples, rx);
         CallHandle { tx }
     }
+
+    /// Expectations not yet consumed by a `transcribe()` call. A test
+    /// polling this to zero knows every expected call has started.
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("fake transcriber mutex poisoned")
+            .len()
+    }
 }
 
 impl Default for FakeTranscriber {

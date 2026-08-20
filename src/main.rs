@@ -161,8 +161,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_store_root = config.store_root.clone();
     let cfg_mic_source = config.mic_source.clone();
     let cfg_monitor_source = config.monitor_source.clone();
-    let cfg_mic_language = config.mic_language.clone();
-    let cfg_monitor_language = config.monitor_language.clone();
+    let cfg_for_params = config.clone();
     let cfg_whisper_url = config.whisper_url.clone();
     let cfg_whisper_timeout = Duration::from_millis(config.whisper_timeout_ms);
     let cfg_translate_backends = config.translate.backends.clone();
@@ -170,11 +169,6 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_translate_reprobe_interval =
         Duration::from_millis(config.translate.reprobe_interval_ms);
     let cfg_target_language = config.target_language.clone();
-    let cfg_vad_threshold = config.vad_threshold;
-    let cfg_silence_hold_ms = config.silence_hold_ms;
-    let cfg_duration_cap_ms = config.duration_cap_ms;
-    let cfg_live_chunk_ms = config.live_chunk_ms;
-    let cfg_confidence_floor = config.confidence_floor;
 
     {
         let window_weak = window.as_weak();
@@ -248,8 +242,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
         let recording_slot = recording.clone();
         let window_weak = window.as_weak();
         let cfg_store_root = cfg_store_root.clone();
-        let cfg_mic_language = cfg_mic_language.clone();
-        let cfg_monitor_language = cfg_monitor_language.clone();
+        let cfg_for_params = cfg_for_params.clone();
         let cfg_whisper_url = cfg_whisper_url.clone();
         let cfg_translate_backends = cfg_translate_backends.clone();
         let cfg_target_language = cfg_target_language.clone();
@@ -304,20 +297,13 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 .unwrap_or(0);
             let store_dir = cfg_store_root.join(secs.to_string());
 
-            let params = RecordingParams {
+            let params = RecordingParams::from_config(
+                &cfg_for_params,
                 store_dir,
                 title,
                 mic_source,
                 monitor_source,
-                mic_language: cfg_mic_language.clone(),
-                monitor_language: cfg_monitor_language.clone(),
-                target_language: cfg_target_language.clone(),
-                vad_threshold: cfg_vad_threshold,
-                silence_hold_ms: cfg_silence_hold_ms,
-                duration_cap_ms: cfg_duration_cap_ms,
-                live_chunk_ms: cfg_live_chunk_ms,
-                confidence_floor: cfg_confidence_floor,
-            };
+            );
 
             let transcriber: Arc<dyn Transcriber> =
                 match WhisperClient::new(&cfg_whisper_url, cfg_whisper_timeout) {

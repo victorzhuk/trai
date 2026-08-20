@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub store_root: PathBuf,
     pub mic_source: String,

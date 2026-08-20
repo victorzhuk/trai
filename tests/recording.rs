@@ -45,6 +45,20 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
+// Poll instead of sleeping a fixed duration: an in-memory Cursor is
+// drained as fast as the scheduler allows, so a fixed margin either
+// wastes time or expires early under CI load.
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the expected condition"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 // Runs the same Segmenter algorithm the Recording under test will run,
 // against the full known PCM, to learn the exact sample range it will
 // carve out as a Segment before we register that range with the fake.
@@ -126,13 +140,13 @@ fn recording_lifecycle_transcribes_both_streams_and_finalizes_wav_and_transcript
     .unwrap();
 
     // Both in-memory Cursors get drained in microseconds with no
-    // real-time pacing (unlike a live pw-record stream), so give both
-    // reader threads a generous margin to reach their blocked
-    // transcribe() call before releasing either response. Without
-    // this, one stream's segment could finish and flush before the
-    // other stream's reader thread has even submitted its own earlier
-    // segment, which this test isn't set up to arbitrate.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // real-time pacing (unlike a live pw-record stream), so wait until
+    // both reader threads have reached their blocked transcribe() call
+    // before releasing either response. Without this, one stream's
+    // segment could finish and flush before the other stream's reader
+    // thread has even submitted its own earlier segment, which this
+    // test isn't set up to arbitrate.
+    wait_until(|| fake.pending_count() == 0);
 
     mic_call.respond(Transcription {
         text: "mic said something".to_string(),

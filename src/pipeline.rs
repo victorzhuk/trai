@@ -603,6 +603,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    // Poll a condition instead of sleeping a fixed duration: a 50ms
+    // sleep expires before a delayed thread runs under CI load, and the
+    // failure then looks like a real regression.
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the expected condition"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     use std::thread;
     use std::time::Duration;
 
@@ -666,7 +680,7 @@ mod tests {
             language: None,
         });
         first_handle.join().unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 1);
         assert_eq!(
             translator.recorded_calls(),
             vec![("segment 1".to_string(), vec![])]
@@ -691,7 +705,7 @@ mod tests {
             language: None,
         });
         second_handle.join().unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 1);
         assert_eq!(
             translator.recorded_calls(),
             vec![("segment 1".to_string(), vec![])]
@@ -699,7 +713,7 @@ mod tests {
 
         first_translate.respond("t1".to_string());
 
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 2);
         assert_eq!(
             translator.recorded_calls(),
             vec![
@@ -745,7 +759,7 @@ mod tests {
             language: None,
         });
         first_handle.join().unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 1);
         assert_eq!(
             translator.recorded_calls(),
             vec![("segment 1".to_string(), vec![])]
@@ -770,7 +784,7 @@ mod tests {
             language: None,
         });
         second_handle.join().unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 1);
         assert_eq!(
             translator.recorded_calls(),
             vec![("segment 1".to_string(), vec![])]
@@ -780,7 +794,7 @@ mod tests {
             "forced failure",
         ));
 
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| translator.recorded_calls().len() == 2);
         assert_eq!(
             translator.recorded_calls(),
             vec![
@@ -1019,10 +1033,12 @@ mod tests {
         let pipeline_later = pipeline.clone();
         let later_handle = thread::spawn(move || pipeline_later.submit(later_input).unwrap());
 
-        // Give both reader threads time to call `begin` before either
-        // transcription completes, so the later segment can't flush
-        // past the still-open earlier span.
-        thread::sleep(Duration::from_millis(50));
+        // Wait until both reader threads have called `begin` before
+        // either transcription completes (an expectation leaves the
+        // pending map only once its transcribe call starts, which is
+        // after begin), so the later segment can't flush past the
+        // still-open earlier span.
+        wait_until(|| fake.pending_count() == 0);
 
         // Release the segment with the LATER start_ms first: its
         // callback fires before the earlier segment's, but the
@@ -1271,7 +1287,7 @@ mod tests {
         let translate = harness.translator.expect_call("hello");
 
         let handle = spawn_submission(&harness.pipeline, SpeakerTag::Me, None, samples);
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| !harness.snapshots().is_empty());
 
         let in_flight = harness.snapshots();
         assert_eq!(
@@ -1317,7 +1333,7 @@ mod tests {
         let transcribe = harness.transcriber.expect_call(samples.clone());
 
         let handle = spawn_submission(&harness.pipeline, SpeakerTag::Them, None, samples);
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| !harness.snapshots().is_empty());
         assert_eq!(harness.last_snapshot().len(), 1);
 
         transcribe.respond(Transcription {
@@ -1341,7 +1357,7 @@ mod tests {
         let transcribe = harness.transcriber.expect_call(samples.clone());
 
         let handle = spawn_submission(&harness.pipeline, SpeakerTag::Me, None, samples);
-        thread::sleep(Duration::from_millis(50));
+        wait_until(|| !harness.snapshots().is_empty());
         transcribe.fail(TranscribeError::new("whisper returned 503"));
 
         let error = handle.join().unwrap().expect_err("transcription failed");

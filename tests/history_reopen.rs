@@ -44,6 +44,18 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
+// Poll instead of sleeping a fixed duration; see tests/recording.rs.
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the expected condition"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 fn expected_span(samples: &[i16]) -> SpeechSpan {
     let mut segmenter = Segmenter::new(
         VAD_THRESHOLD,
@@ -121,7 +133,7 @@ fn record_stop_reopen_transcript_matches_captured_lines() {
     )
     .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    wait_until(|| fake.pending_count() == 0);
 
     mic_call.respond(Transcription {
         text: "mic said something".to_string(),

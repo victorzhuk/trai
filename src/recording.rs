@@ -32,6 +32,34 @@ pub struct RecordingParams {
     pub confidence_floor: f32,
 }
 
+impl RecordingParams {
+    /// Pipeline knobs come from configuration; title, store dir, and
+    /// the two sources come from the wizard (the sources may override
+    /// the configured defaults for this one Recording).
+    pub fn from_config(
+        config: &crate::config::Config,
+        store_dir: PathBuf,
+        title: String,
+        mic_source: String,
+        monitor_source: String,
+    ) -> Self {
+        Self {
+            store_dir,
+            title,
+            mic_source,
+            monitor_source,
+            mic_language: config.mic_language.clone(),
+            monitor_language: config.monitor_language.clone(),
+            target_language: config.target_language.clone(),
+            vad_threshold: config.vad_threshold,
+            silence_hold_ms: config.silence_hold_ms,
+            duration_cap_ms: config.duration_cap_ms,
+            live_chunk_ms: config.live_chunk_ms,
+            confidence_floor: config.confidence_floor,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecordingMeta {
     title: String,
