@@ -399,6 +399,13 @@ fn run_reader<R: io::Read>(
         live_chunk_ms,
     );
     let mut buffer: Vec<i16> = Vec::new();
+    // The Segmenter's spans are absolute sample offsets, so `drained`
+    // tracks how many leading samples have been dropped from `buffer`;
+    // slicing subtracts it. Without draining, the buffer grows for the
+    // whole recording (~115 MB/hr per stream at 16kHz i16).
+    let mut drained: u64 = 0;
+    let mut open_span_start: Option<u64> = None;
+    let mut last_closed_end: u64 = 0;
     // Counted so a stream that captures nothing — the signature of a
     // mis-targeted source — is visible at stop instead of silent.
     let mut samples_read: u64 = 0;
@@ -415,9 +422,15 @@ fn run_reader<R: io::Read>(
                 // and hold back a later stream's segment that would
                 // otherwise finish and flush first.
                 SegmentEvent::Opened { start_sample } => {
+                    open_span_start = Some(start_sample);
                     pipeline.begin(segmenter::to_ms(start_sample));
                 }
                 SegmentEvent::Closed(span) => {
+                    // A duration-cap force-close is immediately followed
+                    // by a new Opened in the same batch, which re-sets
+                    // open_span_start below.
+                    open_span_start = None;
+                    last_closed_end = span.end_sample;
                     segments_closed += 1;
                     crate::debug!(
                         "segment closed {:?} {}..{}ms ({} samples)",
@@ -433,10 +446,16 @@ fn run_reader<R: io::Read>(
                         language.clone(),
                         &buffer,
                         span,
+                        drained,
                     );
                 }
             }
         }
+        drain_dead_prefix(
+            &mut buffer,
+            &mut drained,
+            open_span_start.unwrap_or(last_closed_end),
+        );
     })?;
 
     if let Some(span) = segmenter.finish() {
@@ -450,6 +469,7 @@ fn run_reader<R: io::Read>(
             language,
             &buffer,
             span,
+            drained,
         );
     }
 
@@ -464,6 +484,19 @@ fn run_reader<R: io::Read>(
     wav.finalize()
 }
 
+// Drops samples no span can still reference: anything before the
+// currently open span's start (or the last closed span's end when no
+// span is open) was already copied into a submission thread. Runs per
+// chunk; the threshold keeps the drain amortized instead of per-frame.
+const DRAIN_THRESHOLD_SAMPLES: u64 = segmenter::SAMPLE_RATE_HZ * 60;
+
+fn drain_dead_prefix(buffer: &mut Vec<i16>, drained: &mut u64, floor: u64) {
+    if floor > *drained && floor - *drained > DRAIN_THRESHOLD_SAMPLES {
+        buffer.drain(..(floor - *drained) as usize);
+        *drained = floor;
+    }
+}
+
 fn spawn_submission(
     pipeline: &Arc<Pipeline>,
     submissions: &Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -471,8 +504,11 @@ fn spawn_submission(
     language: Option<String>,
     buffer: &[i16],
     span: SpeechSpan,
+    drained: u64,
 ) {
-    let samples = buffer[span.start_sample as usize..span.end_sample as usize].to_vec();
+    let start = (span.start_sample - drained) as usize;
+    let end = (span.end_sample - drained) as usize;
+    let samples = buffer[start..end].to_vec();
     let start_ms = segmenter::to_ms(span.start_sample);
     let end_ms = segmenter::to_ms(span.end_sample);
     let pipeline = pipeline.clone();
@@ -494,4 +530,30 @@ fn spawn_submission(
         .lock()
         .expect("submissions mutex poisoned")
         .push(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_dead_prefix_drops_only_below_the_floor_and_only_past_threshold() {
+        let mut buffer: Vec<i16> = (0..100).collect();
+        let mut drained = 0;
+
+        drain_dead_prefix(&mut buffer, &mut drained, 50);
+        assert_eq!(buffer.len(), 100, "below the threshold nothing drains");
+        assert_eq!(drained, 0);
+
+        let floor = DRAIN_THRESHOLD_SAMPLES + 50;
+        let mut big: Vec<i16> = vec![0; floor as usize + 10];
+        big[0] = 7;
+        drain_dead_prefix(&mut big, &mut drained, floor);
+        assert_eq!(big.len(), 10);
+        assert_eq!(drained, floor);
+
+        let before = big.len();
+        drain_dead_prefix(&mut big, &mut drained, floor);
+        assert_eq!(big.len(), before, "floor at the offset drains nothing");
+    }
 }

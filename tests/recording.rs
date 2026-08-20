@@ -59,6 +59,27 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
     }
 }
 
+fn expected_spans(samples: &[i16]) -> Vec<SpeechSpan> {
+    let mut segmenter = Segmenter::new(
+        VAD_THRESHOLD,
+        SILENCE_HOLD_MS,
+        DURATION_CAP_MS,
+        DURATION_CAP_MS,
+    );
+    let mut spans: Vec<SpeechSpan> = segmenter
+        .push_samples(samples)
+        .into_iter()
+        .filter_map(|event| match event {
+            SegmentEvent::Closed(span) => Some(span),
+            _ => None,
+        })
+        .collect();
+    if let Some(span) = segmenter.finish() {
+        spans.push(span);
+    }
+    spans
+}
+
 // Runs the same Segmenter algorithm the Recording under test will run,
 // against the full known PCM, to learn the exact sample range it will
 // carve out as a Segment before we register that range with the fake.
@@ -463,4 +484,105 @@ fn meta_json_is_written_at_start_with_title_and_source_names() {
         meta["duration_secs"].as_u64().is_some(),
         "stop-written meta must carry duration_secs"
     );
+}
+
+#[test]
+fn recording_drains_dead_audio_without_corrupting_later_segments() {
+    let mic_formants = [180.0, 420.0, 900.0, 1800.0, 2600.0];
+    let monitor_formants = [220.0, 500.0, 1100.0, 2000.0, 3000.0];
+
+    // 75s of continuous mic speech: three 20s duration-cap force-closes
+    // plus a trailing span at stream end. The dead-prefix drain fires at
+    // 60s, so the spans after it slice the reader buffer through the
+    // drained offset. The fake matches expectations by exact samples, so
+    // a wrong offset fails the transcription instead of passing silently.
+    let mic_samples = synthetic_speech_frame(SAMPLE_RATE_HZ as usize * 75, 0, &mic_formants);
+    let monitor_samples = build_stream_samples(&monitor_formants);
+
+    let mic_spans = expected_spans(&mic_samples);
+    assert!(
+        mic_spans.len() >= 3,
+        "75s at a 20s cap must produce several spans, got {}",
+        mic_spans.len()
+    );
+    let monitor_span = expected_span(&monitor_samples);
+
+    let fake = Arc::new(FakeTranscriber::new());
+    let mic_calls: Vec<_> = mic_spans
+        .iter()
+        .map(|span| {
+            fake.expect_call(
+                mic_samples[span.start_sample as usize..span.end_sample as usize].to_vec(),
+            )
+        })
+        .collect();
+    let monitor_call = fake.expect_call(
+        monitor_samples[monitor_span.start_sample as usize..monitor_span.end_sample as usize]
+            .to_vec(),
+    );
+    let translator = Arc::new(FakeTranslator::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+
+    let params = RecordingParams {
+        store_dir: store_dir.clone(),
+        title: "Long meeting".to_string(),
+        mic_source: "alsa_input.usb-mic".to_string(),
+        monitor_source: "alsa_output.stereo.monitor".to_string(),
+        mic_language: None,
+        monitor_language: None,
+        target_language: "en".to_string(),
+        vad_threshold: VAD_THRESHOLD,
+        silence_hold_ms: SILENCE_HOLD_MS,
+        duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
+        confidence_floor: 0.0,
+    };
+
+    let recording = Recording::start_with_sources(
+        Cursor::new(pcm_bytes(&mic_samples)),
+        Cursor::new(pcm_bytes(&monitor_samples)),
+        params,
+        fake.clone(),
+        translator,
+        |_segments| {},
+    )
+    .unwrap();
+
+    wait_until(|| fake.pending_count() == 0);
+
+    for (i, call) in mic_calls.into_iter().enumerate() {
+        call.respond(Transcription {
+            text: format!("mic span {i}"),
+            mean_confidence: 0.9,
+            language: None,
+        });
+    }
+    monitor_call.respond(Transcription {
+        text: "monitor said something".to_string(),
+        mean_confidence: 0.85,
+        language: None,
+    });
+
+    recording.stop().unwrap();
+
+    let segments = store::read_all(&store_dir.join("segments.jsonl")).unwrap();
+    let mic_segments: Vec<_> = segments
+        .iter()
+        .filter(|s| s.speaker_tag == SpeakerTag::Me)
+        .collect();
+    assert_eq!(
+        mic_segments.len(),
+        mic_spans.len(),
+        "every span past the drain must still transcribe and persist"
+    );
+    for (i, segment) in mic_segments.iter().enumerate() {
+        assert_eq!(segment.text, format!("mic span {i}"));
+        assert_eq!(segment.start_ms, segmenter_to_ms(mic_spans[i].start_sample));
+    }
+}
+
+fn segmenter_to_ms(sample: u64) -> u64 {
+    sample * 1000 / SAMPLE_RATE_HZ
 }
