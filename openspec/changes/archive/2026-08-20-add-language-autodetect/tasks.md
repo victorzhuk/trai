@@ -39,4 +39,4 @@
 ## 7. Configuration and verification
 
 - [x] 7.1 Both per-Stream language keys absent starts normally with detection on both Streams. Acceptance: the example configuration documents them as optional overrides.
-- [ ] 7.2 Record a meeting with one Stream in the target language. Acceptance: those rows appear marked same-language with no backend request, the other Stream translates as before, and the status line reports both languages.
+- [x] 7.2 Record a meeting with one Stream in the target language. Acceptance: those rows appear marked same-language with no backend request, the other Stream translates as before, and the status line reports both languages.

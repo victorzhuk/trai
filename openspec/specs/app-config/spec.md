@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-live-transcription-spine. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: TOML configuration file
 
 All configuration SHALL be read from a TOML file. The file SHALL carry the Store root, the default microphone and monitor source names, the whisper server URL, the silence hold, the Segment duration cap, and the confidence floor. The application SHALL NOT provide any interface for editing configuration.
@@ -64,3 +66,16 @@ The TOML configuration file SHALL define translate backends as an ordered list, 
 - **WHEN** the per-request timeout is changed and the application is restarted
 - **THEN** failover triggers at the new threshold without rebuilding
 
+### Requirement: Optional per-Stream source language overrides
+
+The per-Stream source language keys SHALL be optional. When a key is absent the Stream's language SHALL be detected; when present it SHALL override detection for that Stream. An absent key SHALL NOT be a startup error.
+
+#### Scenario: Configuration omits both language keys
+
+- **WHEN** the application starts with no per-Stream source language configured
+- **THEN** it starts normally and both Streams detect their language
+
+#### Scenario: Configuration pins one Stream's language
+
+- **WHEN** only the microphone Stream's language is configured
+- **THEN** that Stream uses the configured language and the monitor Stream detects its own
