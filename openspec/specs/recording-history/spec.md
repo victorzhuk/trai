@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-recording-history. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Recording list
 
 The application SHALL present a list of past Recordings found in the Store root, ordered newest first, each showing its title, date, duration, and number of transcript lines.
@@ -33,7 +35,7 @@ Opening a Recording from history SHALL display its transcript in the same two pa
 
 ### Requirement: Deleting a Recording
 
-Deleting a Recording SHALL remove its entire directory, including its audio files, and SHALL require a confirmation that names the Recording being deleted.
+Deleting a Recording SHALL remove its entire directory, including its audio files, and SHALL require a confirmation that names the Recording being deleted. While the confirmation is open, keyboard focus SHALL stay within it, its cancel action SHALL have initial focus, Escape SHALL dismiss it, and its destructive confirm action SHALL be visually distinct as dangerous.
 
 #### Scenario: User confirms deletion
 
@@ -42,6 +44,14 @@ Deleting a Recording SHALL remove its entire directory, including its audio file
 
 #### Scenario: User dismisses the confirmation
 
-- **WHEN** the user dismisses the deletion confirmation
+- **WHEN** the user dismisses the deletion confirmation, including by pressing Escape
 - **THEN** nothing is removed from disk
 
+### Requirement: Keyboard access to history
+
+Every action available on a history row by pointer SHALL also be reachable by keyboard: rows SHALL be focusable with a visible focus indicator, and Enter or Space SHALL perform the same action as a click.
+
+#### Scenario: User opens a past Recording without a pointer
+
+- **WHEN** the user moves focus to a history row and presses Enter
+- **THEN** the Recording opens exactly as if the row had been clicked

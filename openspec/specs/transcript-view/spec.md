@@ -82,27 +82,27 @@ The translation column SHALL share the original panel's scrolling container, so 
 
 ### Requirement: Degraded and failed rows are visibly distinct
 
-The translation panel SHALL mark rows whose translation came from a fallback backend, and SHALL show an error state on rows whose translation was rejected. The original panel SHALL show an error state on rows whose transcription failed. In-flight, pending, same-language, Degraded, and error states SHALL be distinguishable from one another and from a normal row.
+Rows whose translation is Degraded and rows whose translation failed SHALL be visually distinct from normal rows and from each other. A Segment whose transcription failed SHALL render its translation half as an absence, in muted ink, rather than as content.
 
 #### Scenario: Row translated by a fallback backend
 
-- **WHEN** a Degraded translation is displayed
-- **THEN** the row carries a visible mark identifying it as lower-quality output, without changing row alignment between the panels
+- **WHEN** a row was translated by a fallback backend
+- **THEN** it carries a visible Degraded mark
 
 #### Scenario: Row whose translation was rejected
 
-- **WHEN** a translation is rejected outright
-- **THEN** the row shows an error state distinct from both the pending placeholder and the Degraded mark
-
-#### Scenario: Row whose transcription failed
-
-- **WHEN** a Segment's transcription request fails
-- **THEN** its row reports the failure in the original panel instead of disappearing, and is not written to the transcript file
+- **WHEN** a row's translation failed
+- **THEN** the failure is visible on the row rather than an empty translation cell
 
 #### Scenario: Row already in the target language
 
 - **WHEN** a Segment in the target language is displayed
 - **THEN** its translation column shows the Segment's text marked as being in the same language, distinct from a pending row and from a translated one
+
+#### Scenario: Row whose transcription failed
+
+- **WHEN** a row's transcription failed
+- **THEN** its translation half renders muted as an absence, not as full-emphasis content
 
 ### Requirement: In-flight work is animated, not static
 
@@ -141,3 +141,12 @@ While a Recording is active the window SHALL show, outside the transcript panels
 
 - **WHEN** no Recording is active
 - **THEN** the status line reports no in-flight work
+
+### Requirement: Readable text contrast
+
+All text in the window SHALL meet WCAG AA contrast (4.5:1 for normal text) against its background on every supported color scheme. Low-emphasis ink reserved for decoration SHALL NOT be used for text.
+
+#### Scenario: Light scheme status text
+
+- **WHEN** status or caption text is shown on a light scheme
+- **THEN** its color passes 4.5:1 contrast against the background
