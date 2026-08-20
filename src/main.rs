@@ -10,10 +10,10 @@ use trai::capture::source_list::{enumerate, resolve_defaults, SourceKind};
 use trai::config::{Config, TranslateBackendConfig};
 use trai::domain::Segment;
 use trai::history;
-use trai::pipeline::Pipeline;
+use trai::pipeline::{Pipeline, TranscriptUpdate};
 use trai::recording::{Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
-use trai::transcript::{build_rows, summarize, TranscriptRow as UiTranscriptRow};
+use trai::transcript::{build_row, summarize, TranscriptRow as UiTranscriptRow};
 use trai::translator::{FallbackTranslator, OpenAITranslator, Translator};
 
 slint::include_modules!();
@@ -63,39 +63,88 @@ fn format_timestamp(secs: u64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hour, minute)
 }
 
+thread_local! {
+    // Owned by the UI thread. Live updates mutate this model in place
+    // (insert/remove/set_row_data), so one row's change costs O(1)
+    // instead of rebuilding and re-rendering the whole list per event.
+    static TRANSCRIPT_MODEL: RefCell<Option<Rc<VecModel<TranscriptRow>>>> =
+        const { RefCell::new(None) };
+}
+
+fn transcript_model() -> Rc<VecModel<TranscriptRow>> {
+    TRANSCRIPT_MODEL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Rc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+        }
+        slot.as_ref().expect("model just initialized").clone()
+    })
+}
+
+fn to_ui_row(segment: &Segment, target_language: &str) -> TranscriptRow {
+    let row: UiTranscriptRow = build_row(segment, target_language);
+    TranscriptRow {
+        speaker: row.speaker.into(),
+        mine: row.mine,
+        timestamp: row.timestamp.into(),
+        text: row.text.into(),
+        translation: row.translation.into(),
+        transcribing: row.transcribing,
+        text_failed: row.text_failed,
+        pending: row.pending,
+        verbatim: row.verbatim,
+        degraded: row.degraded,
+        error: row.error,
+    }
+}
+
 fn to_ui_rows(segments: &[Segment], target_language: &str) -> Vec<TranscriptRow> {
-    build_rows(segments, target_language)
-        .into_iter()
-        .map(|row: UiTranscriptRow| TranscriptRow {
-            speaker: row.speaker.into(),
-            mine: row.mine,
-            timestamp: row.timestamp.into(),
-            text: row.text.into(),
-            translation: row.translation.into(),
-            transcribing: row.transcribing,
-            text_failed: row.text_failed,
-            pending: row.pending,
-            verbatim: row.verbatim,
-            degraded: row.degraded,
-            error: row.error,
-        })
+    segments
+        .iter()
+        .map(|segment| to_ui_row(segment, target_language))
         .collect()
 }
 
 fn make_transcript_updater(
     window_weak: slint::Weak<AppWindow>,
     target_language: String,
-) -> impl Fn(Vec<Segment>) + Send + Sync + 'static {
-    move |segments: Vec<Segment>| {
-        let rows = to_ui_rows(&segments, &target_language);
-        let status = summarize(&segments, &target_language);
+) -> impl Fn(TranscriptUpdate) + Send + Sync + 'static {
+    // Mirrors the live view on the callback's side so the status chips
+    // can be recomputed without the pipeline shipping a full snapshot
+    // per event. Fresh per Recording: rows accumulate from an empty
+    // live view, matching the model reset in on_begin_clicked.
+    let mirror: Arc<Mutex<Vec<Segment>>> = Arc::new(Mutex::new(Vec::new()));
+    move |update: TranscriptUpdate| {
+        let status = {
+            let mut mirror = mirror.lock().expect("transcript mirror mutex poisoned");
+            match &update {
+                TranscriptUpdate::Insert { index, segment } => {
+                    mirror.insert(*index, segment.clone())
+                }
+                TranscriptUpdate::Replace { index, segment } => mirror[*index] = segment.clone(),
+                TranscriptUpdate::Remove { index } => {
+                    mirror.remove(*index);
+                }
+            }
+            summarize(&mirror, &target_language)
+        };
         let window_weak = window_weak.clone();
-        // Marshals each live-view snapshot onto the UI thread.
-        // Captures only the Send-safe weak handle; the row model
-        // is rebuilt off-thread and handed to invoke_from_event_loop.
+        let target_language = target_language.clone();
+        // Marshals each update onto the UI thread, which owns the model.
         let _ = slint::invoke_from_event_loop(move || {
+            let model = transcript_model();
+            match update {
+                TranscriptUpdate::Insert { index, segment } => {
+                    model.insert(index, to_ui_row(&segment, &target_language));
+                }
+                TranscriptUpdate::Replace { index, segment } => {
+                    model.set_row_data(index, to_ui_row(&segment, &target_language));
+                }
+                TranscriptUpdate::Remove { index } => {
+                    model.remove(index);
+                }
+            }
             if let Some(w) = window_weak.upgrade() {
-                w.set_transcript_rows(ModelRc::new(VecModel::from(rows)));
                 w.set_pending_transcriptions(status.transcribing as i32);
                 w.set_pending_translations(status.translating as i32);
                 w.set_failed_transcriptions(status.failed as i32);
@@ -145,6 +194,7 @@ fn refresh_history_rows(store_root: &Path, window_weak: slint::Weak<AppWindow>) 
 
 fn run(config: Config) -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
+    window.set_transcript_rows(ModelRc::from(transcript_model()));
 
     let recording: Rc<RefCell<Option<Recording>>> = Rc::new(RefCell::new(None));
     // The active recording's Pipeline, kept so the force-stop button
@@ -287,6 +337,9 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 }
             };
             w.set_wizard_error("".into());
+            // Live rows accumulate incrementally from here; drop whatever
+            // a replay or a previous Recording left in the model.
+            transcript_model().set_vec(Vec::new());
 
             let title = {
                 let t = w.get_wizard_title().to_string();
@@ -485,7 +538,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 .clone()
                 .unwrap_or_else(|| cfg_target_language.clone());
             let rows = to_ui_rows(&segments, &target_language);
-            w.set_transcript_rows(ModelRc::new(VecModel::from(rows)));
+            transcript_model().set_vec(rows);
             w.set_target_language(target_language.as_str().into());
             w.set_replay_title(entry.title.clone().into());
             w.set_replay_open(true);
@@ -502,7 +555,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             if let Some(w) = window_weak.upgrade() {
                 w.set_replay_open(false);
                 w.set_replay_title("".into());
-                w.set_transcript_rows(ModelRc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+                transcript_model().set_vec(Vec::new());
                 // A replayed Recording may have used a different target
                 // language; put the configured one back.
                 w.set_target_language(cfg_target_language.as_str().into());
@@ -540,7 +593,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             w.set_replay_open(false);
             w.set_delete_confirmation_open(false);
             w.set_replay_title("".into());
-            w.set_transcript_rows(ModelRc::new(VecModel::from(Vec::<TranscriptRow>::new())));
+            transcript_model().set_vec(Vec::new());
             refresh_history_rows(&cfg_store_root, window_weak.clone());
         });
     }

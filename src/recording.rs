@@ -11,8 +11,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::capture::pw_record;
 use crate::capture::tee_pcm_to_wav;
 use crate::capture::wav_writer::WavWriter;
-use crate::domain::{Segment, SpeakerTag};
-use crate::pipeline::{Pipeline, SegmentInput};
+use crate::domain::SpeakerTag;
+use crate::pipeline::{Pipeline, SegmentInput, TranscriptUpdate};
 use crate::segmenter::{self, SegmentEvent, Segmenter, SpeechSpan};
 use crate::store::Store;
 use crate::transcriber::Transcriber;
@@ -171,7 +171,7 @@ impl Recording {
         params: RecordingParams,
         transcriber: Arc<dyn Transcriber>,
         translator: Arc<dyn Translator>,
-        on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
+        on_transcript_update: impl Fn(TranscriptUpdate) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         crate::debug!(
             "recording: start mic={} monitor={} dir={} langs={:?}/{:?} vad={} hold={}ms cap={}ms chunk={}ms floor={}",
@@ -254,7 +254,7 @@ impl Recording {
         params: RecordingParams,
         transcriber: Arc<dyn Transcriber>,
         translator: Arc<dyn Translator>,
-        on_transcript_update: impl Fn(Vec<Segment>) + Send + Sync + 'static,
+        on_transcript_update: impl Fn(TranscriptUpdate) + Send + Sync + 'static,
     ) -> io::Result<Self>
     where
         R1: io::Read + Send + 'static,

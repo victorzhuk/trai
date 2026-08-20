@@ -31,54 +31,56 @@ pub struct TranscriptStatus {
     pub degraded: bool,
 }
 
+pub fn build_row(segment: &Segment, target_language: &str) -> TranscriptRow {
+    let mut row = TranscriptRow {
+        speaker: speaker_label(segment.speaker_tag).into(),
+        mine: segment.speaker_tag == SpeakerTag::Me,
+        timestamp: format_timestamp(segment.start_ms),
+        text: segment.text.clone(),
+        translation: PENDING.to_string(),
+        transcribing: false,
+        text_failed: false,
+        pending: true,
+        verbatim: false,
+        degraded: false,
+        error: false,
+    };
+
+    match &segment.state {
+        SegmentState::Transcribing => {
+            row.transcribing = true;
+            row.text = PENDING.to_string();
+        }
+        SegmentState::Failed(message) => {
+            row.text = message.clone();
+            row.text_failed = true;
+            row.translation = NO_TRANSLATION.to_string();
+            row.pending = false;
+        }
+        SegmentState::Ready => {
+            if let Some(message) = &segment.translation_error {
+                row.translation = message.clone();
+                row.pending = false;
+                row.error = true;
+            } else if let Some(translation) = &segment.translation {
+                row.translation = translation.clone();
+                row.pending = false;
+                row.degraded = segment.degraded;
+            } else if segment.is_target_language(target_language) {
+                row.translation = segment.text.clone();
+                row.pending = false;
+                row.verbatim = true;
+            }
+        }
+    }
+
+    row
+}
+
 pub fn build_rows(segments: &[Segment], target_language: &str) -> Vec<TranscriptRow> {
     segments
         .iter()
-        .map(|segment| {
-            let mut row = TranscriptRow {
-                speaker: speaker_label(segment.speaker_tag).into(),
-                mine: segment.speaker_tag == SpeakerTag::Me,
-                timestamp: format_timestamp(segment.start_ms),
-                text: segment.text.clone(),
-                translation: PENDING.to_string(),
-                transcribing: false,
-                text_failed: false,
-                pending: true,
-                verbatim: false,
-                degraded: false,
-                error: false,
-            };
-
-            match &segment.state {
-                SegmentState::Transcribing => {
-                    row.transcribing = true;
-                    row.text = PENDING.to_string();
-                }
-                SegmentState::Failed(message) => {
-                    row.text = message.clone();
-                    row.text_failed = true;
-                    row.translation = NO_TRANSLATION.to_string();
-                    row.pending = false;
-                }
-                SegmentState::Ready => {
-                    if let Some(message) = &segment.translation_error {
-                        row.translation = message.clone();
-                        row.pending = false;
-                        row.error = true;
-                    } else if let Some(translation) = &segment.translation {
-                        row.translation = translation.clone();
-                        row.pending = false;
-                        row.degraded = segment.degraded;
-                    } else if segment.is_target_language(target_language) {
-                        row.translation = segment.text.clone();
-                        row.pending = false;
-                        row.verbatim = true;
-                    }
-                }
-            }
-
-            row
-        })
+        .map(|segment| build_row(segment, target_language))
         .collect()
 }
 

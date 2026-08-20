@@ -139,17 +139,17 @@ impl Persisted {
     // The row was inserted at this Segment's start_ms when it closed and
     // start_ms cannot have changed since, so filling it in place keeps
     // live_view sorted without re-inserting.
-    fn replace_live_row(&mut self, segment: Segment) {
+    fn replace_live_row(&mut self, segment: Segment) -> (usize, bool) {
         if let Some(&position) = self.row_index.get(&segment.id) {
             self.live_view[position] = segment;
-            return;
+            return (position, true);
         }
-        self.insert_live_row(segment);
+        (self.insert_live_row(segment), false)
     }
 
     // Sorted insert that keeps row_index valid: everything at or past
-    // the insertion point shifts by one.
-    fn insert_live_row(&mut self, segment: Segment) {
+    // the insertion point shifts by one. Returns the insertion index.
+    fn insert_live_row(&mut self, segment: Segment) -> usize {
         let position = self
             .live_view
             .partition_point(|existing| existing.start_ms <= segment.start_ms);
@@ -160,23 +160,24 @@ impl Persisted {
         }
         self.row_index.insert(segment.id, position);
         self.live_view.insert(position, segment);
+        position
     }
 
-    fn fail_live_row(&mut self, segment_id: u64, message: String) {
-        if let Some(&position) = self.row_index.get(&segment_id) {
-            self.live_view[position].state = SegmentState::Failed(message);
-        }
+    fn fail_live_row(&mut self, segment_id: u64, message: String) -> Option<usize> {
+        let &position = self.row_index.get(&segment_id)?;
+        self.live_view[position].state = SegmentState::Failed(message);
+        Some(position)
     }
 
-    fn drop_live_row(&mut self, segment_id: u64) {
-        if let Some(position) = self.row_index.remove(&segment_id) {
-            self.live_view.remove(position);
-            for index in self.row_index.values_mut() {
-                if *index > position {
-                    *index -= 1;
-                }
+    fn drop_live_row(&mut self, segment_id: u64) -> Option<usize> {
+        let position = self.row_index.remove(&segment_id)?;
+        self.live_view.remove(position);
+        for index in self.row_index.values_mut() {
+            if *index > position {
+                *index -= 1;
             }
         }
+        Some(position)
     }
 
     fn translation_context(&self, segment_id: u64, target_language: &str) -> Vec<String> {
@@ -223,9 +224,17 @@ fn configured_language(configured: Option<&str>) -> Option<String> {
     )
 }
 
-// Snapshot callback fired with a full, sorted copy of `live_view` each
-// time a Segment passes the confidence floor or gains a translation.
-type TranscriptUpdateCallback = Box<dyn Fn(Vec<Segment>) + Send + Sync>;
+/// One change to the live view. Replaces full-snapshot callbacks: a
+/// long meeting would otherwise deep-clone every row on every event
+/// and re-render the whole list for a one-row change.
+pub enum TranscriptUpdate {
+    Insert { index: usize, segment: Segment },
+    Replace { index: usize, segment: Segment },
+    Remove { index: usize },
+}
+
+// Fired (off the Pipeline's internal locks) with each live-view change.
+type TranscriptUpdateCallback = Box<dyn Fn(TranscriptUpdate) + Send + Sync>;
 
 /// Turns Segments into transcribed, ordered, persisted ones. Callers
 /// with a distinct open-span phase should call `begin` the instant a
@@ -314,13 +323,9 @@ impl Pipeline {
         }
     }
 
-    /// Registers a callback fired (off the Pipeline's internal lock)
-    /// with a full, sorted snapshot of `live_view` every time a
-    /// Segment passes the confidence floor. No-op if never called.
-    /// The callback receives `Vec<Segment>` by value and must be
-    /// `Send + Sync` because it is invoked from the submission and
-    /// translation threads, not the UI thread.
-    pub fn set_on_update(&self, callback: impl Fn(Vec<Segment>) + Send + Sync + 'static) {
+    /// The callback is invoked from the submission and translation
+    /// threads, not the UI thread.
+    pub fn set_on_update(&self, callback: impl Fn(TranscriptUpdate) + Send + Sync + 'static) {
         *self.on_update.lock().expect("on_update mutex poisoned") = Some(Box::new(callback));
     }
 
@@ -347,24 +352,28 @@ impl Pipeline {
         let segment_id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let configured_language = configured_language(input.language.as_deref());
 
-        let snapshot = {
-            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
-            persisted.insert_live_row(Segment {
-                id: segment_id,
-                speaker_tag: input.speaker_tag,
-                start_ms: input.start_ms,
-                end_ms: input.end_ms,
-                text: String::new(),
-                mean_confidence: 0.0,
-                source_language: configured_language.clone(),
-                translation: None,
-                degraded: false,
-                state: SegmentState::Transcribing,
-                translation_error: None,
-            });
-            persisted.live_view.clone()
+        let placeholder = Segment {
+            id: segment_id,
+            speaker_tag: input.speaker_tag,
+            start_ms: input.start_ms,
+            end_ms: input.end_ms,
+            text: String::new(),
+            mean_confidence: 0.0,
+            source_language: configured_language.clone(),
+            translation: None,
+            degraded: false,
+            state: SegmentState::Transcribing,
+            translation_error: None,
         };
-        self.fire_update(snapshot);
+        let update = {
+            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+            let index = persisted.insert_live_row(placeholder.clone());
+            TranscriptUpdate::Insert {
+                index,
+                segment: placeholder,
+            }
+        };
+        self.fire(update);
 
         let outcome = self
             .transcriber
@@ -373,22 +382,28 @@ impl Pipeline {
         let transcription = match outcome {
             Ok(transcription) => transcription,
             Err(e) => {
-                let snapshot = {
+                let update = {
                     let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
                     persisted.retire_in_flight(input.start_ms);
-                    persisted.fail_live_row(segment_id, e.to_string());
-                    persisted.live_view.clone()
+                    persisted
+                        .fail_live_row(segment_id, e.to_string())
+                        .map(|index| TranscriptUpdate::Replace {
+                            index,
+                            segment: persisted.live_view[index].clone(),
+                        })
                 };
                 // The failed row is worth more on screen than the flush
                 // result is, so it goes out before the error propagates.
-                self.fire_update(snapshot);
+                if let Some(update) = update {
+                    self.fire(update);
+                }
                 self.flush_ready()?;
                 return Err(e.into());
             }
         };
 
         let mut translation_job = None;
-        let snapshot = {
+        let update = {
             let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
             persisted.retire_in_flight(input.start_ms);
 
@@ -426,7 +441,12 @@ impl Pipeline {
                     translation_job = Some((segment_id, segment.text.clone()));
                 }
                 insert_ordered(&mut persisted.transcript, segment.clone());
-                persisted.replace_live_row(segment);
+                let (index, replaced) = persisted.replace_live_row(segment.clone());
+                if replaced {
+                    Some(TranscriptUpdate::Replace { index, segment })
+                } else {
+                    Some(TranscriptUpdate::Insert { index, segment })
+                }
             } else {
                 // Dropped here and nowhere else: without this line the
                 // segment leaves no trace at all, in the UI or on disk.
@@ -439,14 +459,16 @@ impl Pipeline {
                     self.confidence_floor,
                     crate::log::preview(&segment.text, 60),
                 );
-                persisted.drop_live_row(segment_id);
+                persisted
+                    .drop_live_row(segment_id)
+                    .map(|index| TranscriptUpdate::Remove { index })
             }
-
-            persisted.live_view.clone()
         };
 
         self.flush_ready()?;
-        self.fire_update(snapshot);
+        if let Some(update) = update {
+            self.fire(update);
+        }
 
         if let Some((segment_id, text)) = translation_job {
             self.dispatch_translation(segment_id, text);
@@ -649,31 +671,34 @@ impl Pipeline {
         segment_id: u64,
         mutate: impl FnOnce(&mut Segment),
     ) -> Result<(), PipelineError> {
-        let snapshot = {
+        let update = {
             let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
-            let Some(&position) = persisted.row_index.get(&segment_id) else {
+            let Some(&index) = persisted.row_index.get(&segment_id) else {
                 return Ok(());
             };
 
-            mutate(&mut persisted.live_view[position]);
-            persisted.live_view.clone()
+            mutate(&mut persisted.live_view[index]);
+            TranscriptUpdate::Replace {
+                index,
+                segment: persisted.live_view[index].clone(),
+            }
         };
 
         if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
-            callback(snapshot);
+            callback(update);
         }
 
         Ok(())
     }
 
-    fn fire_update(&self, snapshot: Vec<Segment>) {
+    fn fire(&self, update: TranscriptUpdate) {
         if let Some(callback) = self
             .on_update
             .lock()
             .expect("on_update mutex poisoned")
             .as_ref()
         {
-            callback(snapshot);
+            callback(update);
         }
     }
 }
@@ -700,6 +725,28 @@ mod tests {
                 "timed out waiting for the expected condition"
             );
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+    // Folds the incremental update stream back into the full-snapshot
+    // sequence these tests assert against.
+    fn apply_update(mirror: &mut Vec<Segment>, update: TranscriptUpdate) {
+        match update {
+            TranscriptUpdate::Insert { index, segment } => mirror.insert(index, segment),
+            TranscriptUpdate::Replace { index, segment } => mirror[index] = segment,
+            TranscriptUpdate::Remove { index } => {
+                mirror.remove(index);
+            }
+        }
+    }
+
+    fn folding_callback(
+        snapshots: Arc<Mutex<Vec<Vec<Segment>>>>,
+    ) -> impl Fn(TranscriptUpdate) + Send + Sync + 'static {
+        let mirror: Arc<Mutex<Vec<Segment>>> = Arc::new(Mutex::new(Vec::new()));
+        move |update| {
+            let mut mirror = mirror.lock().unwrap();
+            apply_update(&mut mirror, update);
+            snapshots.lock().unwrap().push(mirror.clone());
         }
     }
     use std::thread;
@@ -912,11 +959,9 @@ mod tests {
         let pipeline = Arc::new(Pipeline::new(transcriber, translator, store, 0.0, "en"));
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-        let snapshots_for_cb = snapshots.clone();
-        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> =
-            Arc::new(Mutex::new(Some(Box::new(move |snapshot: Vec<Segment>| {
-                snapshots_for_cb.lock().unwrap().push(snapshot);
-            }))));
+        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> = Arc::new(Mutex::new(Some(
+            Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
+        )));
 
         Pipeline::record_translation(
             pipeline.persisted.clone(),
@@ -943,11 +988,9 @@ mod tests {
         let pipeline = Arc::new(Pipeline::new(transcriber, translator, store, 0.0, "en"));
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-        let snapshots_for_cb = snapshots.clone();
-        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> =
-            Arc::new(Mutex::new(Some(Box::new(move |snapshot: Vec<Segment>| {
-                snapshots_for_cb.lock().unwrap().push(snapshot);
-            }))));
+        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> = Arc::new(Mutex::new(Some(
+            Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
+        )));
 
         Pipeline::record_translation_error(
             pipeline.persisted.clone(),
@@ -978,10 +1021,7 @@ mod tests {
         ));
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-        let snapshots_for_cb = snapshots.clone();
-        pipeline.set_on_update(move |segments| {
-            snapshots_for_cb.lock().unwrap().push(segments);
-        });
+        pipeline.set_on_update(folding_callback(snapshots.clone()));
 
         let samples = vec![9i16; 8];
         let transcribe_call = transcriber.expect_call(samples.clone());
@@ -1044,11 +1084,9 @@ mod tests {
             });
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-        let snapshots_for_cb = snapshots.clone();
-        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> =
-            Arc::new(Mutex::new(Some(Box::new(move |snapshot: Vec<Segment>| {
-                snapshots_for_cb.lock().unwrap().push(snapshot);
-            }))));
+        let on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>> = Arc::new(Mutex::new(Some(
+            Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
+        )));
 
         let err = Pipeline::record_translation(
             pipeline.persisted.clone(),
@@ -1088,10 +1126,7 @@ mod tests {
         let pipeline = Arc::new(Pipeline::new(fake.clone(), translator, store, 0.0, "en"));
 
         let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-        let snapshots_for_cb = snapshots.clone();
-        pipeline.set_on_update(move |segments| {
-            snapshots_for_cb.lock().unwrap().push(segments);
-        });
+        pipeline.set_on_update(folding_callback(snapshots.clone()));
 
         let earlier_samples = vec![11i16; 8];
         let later_samples = vec![22i16; 8];
@@ -1320,10 +1355,7 @@ mod tests {
             ));
 
             let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
-            let snapshots_for_cb = snapshots.clone();
-            pipeline.set_on_update(move |segments| {
-                snapshots_for_cb.lock().unwrap().push(segments);
-            });
+            pipeline.set_on_update(folding_callback(snapshots.clone()));
 
             Self {
                 path,
