@@ -129,11 +129,6 @@ fn format_timestamp(start_ms: u64) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
-pub fn insert_ordered(transcript: &mut Vec<Segment>, segment: Segment) {
-    let position = transcript.partition_point(|existing| existing.start_ms <= segment.start_ms);
-    transcript.insert(position, segment);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,11 +159,11 @@ mod tests {
     fn out_of_order_segments_land_sorted_by_start_ms() {
         let mut transcript: Vec<Segment> = Vec::new();
 
-        super::insert_ordered(
+        crate::domain::insert_ordered(
             &mut transcript,
             make_segment(1, SpeakerTag::Them, 500, None),
         );
-        super::insert_ordered(&mut transcript, make_segment(2, SpeakerTag::Me, 0, None));
+        crate::domain::insert_ordered(&mut transcript, make_segment(2, SpeakerTag::Me, 0, None));
 
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].start_ms, 0);
@@ -181,14 +176,14 @@ mod tests {
     fn late_arriving_reply_inserts_at_its_timestamp_not_at_the_end() {
         let mut transcript: Vec<Segment> = Vec::new();
 
-        super::insert_ordered(&mut transcript, make_segment(1, SpeakerTag::Me, 0, None));
-        super::insert_ordered(
+        crate::domain::insert_ordered(&mut transcript, make_segment(1, SpeakerTag::Me, 0, None));
+        crate::domain::insert_ordered(
             &mut transcript,
             make_segment(2, SpeakerTag::Them, 500, None),
         );
 
         // Arrives last, but its start_ms sits between the first two.
-        super::insert_ordered(&mut transcript, make_segment(3, SpeakerTag::Me, 250, None));
+        crate::domain::insert_ordered(&mut transcript, make_segment(3, SpeakerTag::Me, 250, None));
 
         assert_eq!(transcript.len(), 3);
         assert_eq!(transcript[0].id, 1);

@@ -1,9 +1,8 @@
 use crate::confidence::passes_floor;
-use crate::domain::{Segment, SegmentState, SpeakerTag};
+use crate::domain::{insert_ordered, Segment, SegmentState, SpeakerTag};
 use crate::language;
 use crate::store::{Record, Store};
 use crate::transcriber::{TranscribeError, Transcriber};
-use crate::transcript::insert_ordered;
 use crate::translator::Translator;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,6 +19,10 @@ pub struct SegmentInput {
     pub samples: Vec<i16>,
     pub language: Option<String>,
 }
+
+// How often drain_translations wakes to check force-stop while the
+// watcher thread joins settled translation handles.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -379,9 +382,10 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Convenience for callers with no separate open-span phase (existing
-    /// tests use this): begin + finish_pending combined, net-identical
-    /// behavior to before this change.
+    /// Convenience for tests with no separate open-span phase:
+    /// begin + finish_pending combined. Production uses the two-phase
+    /// contract (recording.rs registers open spans via begin).
+    #[cfg(test)]
     pub fn submit(&self, input: SegmentInput) -> Result<(), PipelineError> {
         self.begin(input.start_ms);
         self.finish_pending(input)
@@ -428,7 +432,7 @@ impl Pipeline {
                 crate::debug!("drain_translations: force-stop signaled, detaching remaining translation threads");
                 return;
             }
-            match settled_rx.recv_timeout(Duration::from_millis(100)) {
+            match settled_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
                 Ok(()) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -484,7 +488,7 @@ impl Pipeline {
                         translation.text,
                         translation.degraded,
                     ) {
-                        eprintln!("translation persist failed: {e}");
+                        crate::debug!("translation persist failed: {e}");
                     }
                 }
                 Err(e) => {
@@ -492,7 +496,6 @@ impl Pipeline {
                         "translate: segment {segment_id} failed after {:.2}s: {e}",
                         began.elapsed().as_secs_f64()
                     );
-                    eprintln!("translation failed: {e}");
                     if e.is_misconfigured() {
                         if let Err(store_err) = Self::record_translation_error(
                             persisted,
@@ -500,7 +503,7 @@ impl Pipeline {
                             segment_id,
                             e.to_string(),
                         ) {
-                            eprintln!("translation error persist failed: {store_err}");
+                            crate::debug!("translation error persist failed: {store_err}");
                         }
                     }
                 }
@@ -522,34 +525,18 @@ impl Pipeline {
         text: String,
         degraded: bool,
     ) -> Result<(), PipelineError> {
-        let snapshot = {
-            let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
-            let Some(position) = persisted
-                .live_view
-                .iter()
-                .position(|segment| segment.id == segment_id)
-            else {
-                return Ok(());
-            };
-
+        Self::mutate_row(persisted, on_update, segment_id, |persisted, position| {
             persisted.store.append_record(&Record::Translation {
                 segment_id,
                 text: text.clone(),
                 degraded,
             })?;
-            persisted.live_view[position].translation = Some(text);
-            persisted.live_view[position].degraded = degraded;
-            persisted.live_view[position].translation_error = None;
-            Some(persisted.live_view.clone())
-        };
-
-        if let Some(snapshot) = snapshot {
-            if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
-                callback(snapshot);
-            }
-        }
-
-        Ok(())
+            let row = &mut persisted.live_view[position];
+            row.translation = Some(text);
+            row.degraded = degraded;
+            row.translation_error = None;
+            Ok(())
+        })
     }
 
     fn record_translation_error(
@@ -557,6 +544,21 @@ impl Pipeline {
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         segment_id: u64,
         message: String,
+    ) -> Result<(), PipelineError> {
+        Self::mutate_row(persisted, on_update, segment_id, |persisted, position| {
+            persisted.live_view[position].translation_error = Some(message);
+            Ok(())
+        })
+    }
+
+    // Shared shape of the per-row updates: lock, find by id (a row that
+    // left the live view is a no-op), mutate, then notify with a fresh
+    // snapshot outside the lock.
+    fn mutate_row(
+        persisted: Arc<Mutex<Persisted>>,
+        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+        segment_id: u64,
+        mutate: impl FnOnce(&mut Persisted, usize) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         let snapshot = {
             let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
@@ -568,14 +570,12 @@ impl Pipeline {
                 return Ok(());
             };
 
-            persisted.live_view[position].translation_error = Some(message);
-            Some(persisted.live_view.clone())
+            mutate(&mut persisted, position)?;
+            persisted.live_view.clone()
         };
 
-        if let Some(snapshot) = snapshot {
-            if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
-                callback(snapshot);
-            }
+        if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
+            callback(snapshot);
         }
 
         Ok(())
@@ -776,7 +776,9 @@ mod tests {
             vec![("segment 1".to_string(), vec![])]
         );
 
-        first_translate.fail(crate::translator::TranslateError::new("forced failure"));
+        first_translate.fail(crate::translator::TranslateError::unavailable(
+            "forced failure",
+        ));
 
         thread::sleep(Duration::from_millis(50));
         assert_eq!(

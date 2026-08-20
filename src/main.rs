@@ -393,7 +393,9 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             // Keep a handle to the Pipeline so the force-stop button
             // can signal it while stop() drains in the background.
             let pipeline = recording.pipeline().clone();
-            *force_stop_pipeline_slot.lock().unwrap() = Some(pipeline);
+            *force_stop_pipeline_slot
+                .lock()
+                .expect("force-stop slot mutex poisoned") = Some(pipeline);
 
             // stop() joins both reader threads and every outstanding
             // submission thread, so it can block for the tail of an
@@ -423,7 +425,9 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                     }
                     // The Pipeline is no longer draining, so drop the
                     // force-stop handle.
-                    *force_stop_pipeline_slot.lock().unwrap() = None;
+                    *force_stop_pipeline_slot
+                        .lock()
+                        .expect("force-stop slot mutex poisoned") = None;
                     refresh_history_rows(&cfg_store_root, window_weak);
                 });
             });
@@ -433,7 +437,11 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     {
         let force_stop_pipeline_slot = force_stop_pipeline.clone();
         window.on_force_stop_clicked(move || {
-            if let Some(p) = force_stop_pipeline_slot.lock().unwrap().as_ref() {
+            if let Some(p) = force_stop_pipeline_slot
+                .lock()
+                .expect("force-stop slot mutex poisoned")
+                .as_ref()
+            {
                 p.signal_force_stop();
             }
         });

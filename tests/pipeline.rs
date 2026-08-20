@@ -39,9 +39,15 @@ fn transcript_lands_in_start_ms_order_even_when_the_later_segment_replies_first(
     };
 
     let pipeline_earlier = pipeline.clone();
-    let earlier_handle = thread::spawn(move || pipeline_earlier.submit(earlier_input).unwrap());
+    let earlier_handle = thread::spawn(move || {
+        pipeline_earlier.begin(earlier_input.start_ms);
+        pipeline_earlier.finish_pending(earlier_input).unwrap();
+    });
     let pipeline_later = pipeline.clone();
-    let later_handle = thread::spawn(move || pipeline_later.submit(later_input).unwrap());
+    let later_handle = thread::spawn(move || {
+        pipeline_later.begin(later_input.start_ms);
+        pipeline_later.finish_pending(later_input).unwrap();
+    });
 
     // Release the segment with the LATER start_ms first: its reply
     // arrives before the earlier segment's, but the persisted

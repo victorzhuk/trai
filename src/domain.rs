@@ -52,3 +52,10 @@ impl Segment {
             .is_some_and(|source| crate::language::same(source, target_language))
     }
 }
+
+// Ordering primitive the pipeline's persistence and the live view both
+// rely on: a Segment lands by start_ms, not arrival order.
+pub fn insert_ordered(transcript: &mut Vec<Segment>, segment: Segment) {
+    let position = transcript.partition_point(|existing| existing.start_ms <= segment.start_ms);
+    transcript.insert(position, segment);
+}

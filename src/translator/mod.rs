@@ -35,10 +35,6 @@ impl TranslateError {
         }
     }
 
-    pub fn new(message: impl Into<String>) -> Self {
-        Self::unavailable(message)
-    }
-
     pub fn kind(&self) -> TranslateErrorKind {
         self.kind
     }

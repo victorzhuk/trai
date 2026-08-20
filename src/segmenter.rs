@@ -65,9 +65,12 @@ impl Segmenter {
     pub fn push_samples(&mut self, samples: &[i16]) -> Vec<SegmentEvent> {
         self.buffer.extend_from_slice(samples);
         let mut events = Vec::new();
-        while self.buffer.len() >= FRAME_LEN {
-            let frame: Vec<i16> = self.buffer.drain(..FRAME_LEN).collect();
-            self.process_frame(&frame, &mut events);
+        // One drain per call, not per frame: this runs at 62.5 fps per
+        // stream, so per-frame drain would alloc and memmove per frame.
+        let ready = self.buffer.len() / FRAME_LEN * FRAME_LEN;
+        let chunk: Vec<i16> = self.buffer.drain(..ready).collect();
+        for frame in chunk.chunks_exact(FRAME_LEN) {
+            self.process_frame(frame, &mut events);
         }
         events
     }

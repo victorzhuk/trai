@@ -87,10 +87,12 @@ impl Translator for FakeTranslator {
             .lock()
             .expect("fake translator mutex poisoned")
             .remove(text)
-            .ok_or_else(|| TranslateError::new("no expectation registered for this text"))?;
+            .ok_or_else(|| {
+                TranslateError::unavailable("no expectation registered for this text")
+            })?;
 
         rx.recv()
-            .map_err(|_| TranslateError::new("call handle dropped before responding"))?
+            .map_err(|_| TranslateError::unavailable("call handle dropped before responding"))?
     }
 
     fn probe(&self) -> ProbeOutcome {
@@ -104,10 +106,12 @@ impl Translator for FakeTranslator {
             .lock()
             .expect("fake translator mutex poisoned")
             .pop_front()
-            .ok_or_else(|| TranslateError::new("no expectation registered for this probe"))?;
+            .ok_or_else(|| {
+                TranslateError::unavailable("no expectation registered for this probe")
+            })?;
 
         rx.recv()
-            .map_err(|_| TranslateError::new("probe handle dropped before responding"))?
+            .map_err(|_| TranslateError::unavailable("probe handle dropped before responding"))?
     }
 }
 
