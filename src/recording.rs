@@ -1,6 +1,7 @@
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -40,6 +41,24 @@ struct RecordingMeta {
     target_language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_secs: Option<u64>,
+    // Written at stop so history listing need not re-read the whole
+    // transcript just to count rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segment_count: Option<u64>,
+}
+
+// Transcripts hold meeting content: owner-only from creation.
+fn write_meta(path: &Path, meta: &RecordingMeta) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(meta).map_err(io::Error::other)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("open {}: {e}", path.display())))?;
+    file.write_all(json.as_bytes())
+        .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", path.display())))
 }
 
 pub struct Recording {
@@ -75,7 +94,15 @@ impl Recording {
             params.confidence_floor,
         );
 
-        let mut mic_child = pw_record::spawn(&params.mic_source)?;
+        let mut mic_child = pw_record::spawn(&params.mic_source).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "spawn pw-record for mic source '{}': {e}",
+                    params.mic_source
+                ),
+            )
+        })?;
         let mic_stdout = mic_child
             .stdout
             .take()
@@ -84,8 +111,18 @@ impl Recording {
         let mut monitor_child = match pw_record::spawn(&params.monitor_source) {
             Ok(child) => child,
             Err(e) => {
-                let _ = pw_record::stop(&mut mic_child);
-                return Err(e);
+                if let Err(stop_err) = pw_record::stop(&mut mic_child) {
+                    crate::debug!(
+                        "start: stopping mic pw-record after monitor spawn failed: {stop_err}"
+                    );
+                }
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "spawn pw-record for monitor source '{}': {e}",
+                        params.monitor_source
+                    ),
+                ));
             }
         };
         let monitor_stdout = monitor_child
@@ -103,8 +140,12 @@ impl Recording {
         ) {
             Ok(recording) => recording,
             Err(e) => {
-                let _ = pw_record::stop(&mut mic_child);
-                let _ = pw_record::stop(&mut monitor_child);
+                if let Err(stop_err) = pw_record::stop(&mut mic_child) {
+                    crate::debug!("start: stopping mic pw-record after failure: {stop_err}");
+                }
+                if let Err(stop_err) = pw_record::stop(&mut monitor_child) {
+                    crate::debug!("start: stopping monitor pw-record after failure: {stop_err}");
+                }
                 return Err(e);
             }
         };
@@ -126,7 +167,14 @@ impl Recording {
         R1: io::Read + Send + 'static,
         R2: io::Read + Send + 'static,
     {
-        fs::create_dir_all(&params.store_dir)?;
+        fs::create_dir_all(&params.store_dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("create store dir '{}': {e}", params.store_dir.display()),
+            )
+        })?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&params.store_dir, fs::Permissions::from_mode(0o700))?;
 
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -143,9 +191,9 @@ impl Recording {
             start_time,
             target_language: params.target_language.clone(),
             duration_secs: None,
+            segment_count: None,
         };
-        let meta_json = serde_json::to_string_pretty(&meta).map_err(io::Error::other)?;
-        fs::write(params.store_dir.join("meta.json"), meta_json)?;
+        write_meta(&params.store_dir.join("meta.json"), &meta)?;
 
         let store = Store::open(&params.store_dir.join("segments.jsonl"))?;
         let pipeline = Arc::new(Pipeline::new(
@@ -161,8 +209,10 @@ impl Recording {
         // rows would silently never reach the UI.
         pipeline.set_on_update(on_transcript_update);
 
-        let mic_wav = WavWriter::create(&params.store_dir.join("mic.wav"))?;
-        let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))?;
+        let mic_wav = WavWriter::create(&params.store_dir.join("mic.wav"))
+            .map_err(|e| io::Error::new(e.kind(), format!("create mic.wav: {e}")))?;
+        let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))
+            .map_err(|e| io::Error::new(e.kind(), format!("create monitor.wav: {e}")))?;
 
         let submissions: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -240,11 +290,14 @@ impl Recording {
         );
 
         let at_readers = Instant::now();
-        let mic_result = self.mic_reader.join().expect("mic reader thread panicked");
+        let mic_result = self
+            .mic_reader
+            .join()
+            .map_err(|_| io::Error::other("mic reader thread panicked"))?;
         let monitor_result = self
             .monitor_reader
             .join()
-            .expect("monitor reader thread panicked");
+            .map_err(|_| io::Error::other("monitor reader thread panicked"))?;
         crate::debug!(
             "stop: readers joined in {:.2}s",
             at_readers.elapsed().as_secs_f64()
@@ -255,7 +308,9 @@ impl Recording {
             std::mem::take(&mut *self.submissions.lock().expect("submissions mutex poisoned"));
         let pending = handles.len();
         for handle in handles {
-            handle.join().expect("segment submission thread panicked");
+            handle
+                .join()
+                .map_err(|_| io::Error::other("segment submission thread panicked"))?;
         }
         crate::debug!(
             "stop: {pending} submissions joined in {:.2}s",
@@ -274,8 +329,11 @@ impl Recording {
         monitor_result?;
 
         self.meta.duration_secs = Some(self.start.elapsed().as_secs());
-        let meta_json = serde_json::to_string_pretty(&self.meta).map_err(io::Error::other)?;
-        fs::write(self.store_dir.join("meta.json"), meta_json)?;
+        self.meta.segment_count = Some(
+            crate::store::count_segment_lines(&self.store_dir.join("segments.jsonl")).unwrap_or(0)
+                as u64,
+        );
+        write_meta(&self.store_dir.join("meta.json"), &self.meta)?;
 
         Ok(())
     }
@@ -400,7 +458,7 @@ fn spawn_submission(
             language,
         };
         if let Err(e) = pipeline.finish_pending(input) {
-            eprintln!("segment submission failed: {e}");
+            crate::debug!("segment submission failed: {e}");
         }
     });
 

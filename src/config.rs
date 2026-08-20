@@ -28,11 +28,22 @@ pub struct TranslateConfig {
     pub reprobe_interval_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TranslateBackendConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+}
+
+// Manual Debug so a bearer key never lands in logs via {:?}.
+impl fmt::Debug for TranslateBackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TranslateBackendConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -672,6 +683,19 @@ mod tests {
         let err = Config::from_toml_str(&toml).unwrap_err();
         assert!(err.to_string().contains("translate.backends"));
         assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn backend_debug_output_redacts_the_api_key() {
+        let backend = TranslateBackendConfig {
+            base_url: "http://localhost:11434".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key: Some("super-secret-key".to_string()),
+        };
+
+        let debug = format!("{backend:?}");
+        assert!(!debug.contains("super-secret-key"), "key leaked: {debug}");
+        assert!(debug.contains("<redacted>"));
     }
 
     fn remove_line_starting_with(toml: &str, key: &str) -> String {

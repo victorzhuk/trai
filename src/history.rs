@@ -31,6 +31,8 @@ struct MetaSummary {
     #[serde(default)]
     duration_secs: Option<u64>,
     #[serde(default)]
+    segment_count: Option<u64>,
+    #[serde(default)]
     target_language: Option<String>,
 }
 
@@ -60,8 +62,10 @@ pub fn list_recordings(store_root: &Path) -> io::Result<Vec<RecordingEntry>> {
             continue;
         };
 
-        let line_count = store::read_all(&path.join("segments.jsonl"))
-            .map(|segments| segments.len())
+        let line_count = summary
+            .segment_count
+            .map(|count| count as usize)
+            .or_else(|| store::count_segment_lines(&path.join("segments.jsonl")).ok())
             .unwrap_or(0);
 
         entries.push(RecordingEntry {
@@ -180,6 +184,52 @@ mod tests {
 
         let entries = list_recordings(root.path()).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn list_recordings_prefers_the_persisted_segment_count() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("100");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            r#"{"title":"Counted","mic_source":"mic","monitor_source":"mon","start_time":100,"target_language":"en","duration_secs":60,"segment_count":42}"#,
+        )
+        .unwrap();
+        // A transcript file that does not even parse: the persisted
+        // count must win without the file being read.
+        fs::write(dir.join("segments.jsonl"), "garbage").unwrap();
+
+        let entries = list_recordings(root.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].line_count, 42);
+    }
+
+    #[test]
+    fn list_recordings_counts_segment_lines_without_parsing_when_meta_lacks_a_count() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("100");
+        fs::create_dir_all(&dir).unwrap();
+        write_meta(&dir, "Legacy", 100, Some(60));
+
+        let mut store = Store::open(&dir.join("segments.jsonl")).unwrap();
+        store.append(&make_segment(1)).unwrap();
+        store
+            .append_record(&Record::Translation {
+                segment_id: 1,
+                text: "hola".to_string(),
+                degraded: false,
+            })
+            .unwrap();
+        store.append(&make_segment(2)).unwrap();
+        drop(store);
+
+        let entries = list_recordings(root.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].line_count, 2,
+            "translation records must not count as transcript rows"
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::domain::Segment;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -22,7 +23,12 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let writer = OpenOptions::new().create(true).append(true).open(path)?;
+        // Transcripts hold meeting content: owner-only from creation.
+        let writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
         Ok(Self { writer })
     }
 
@@ -82,6 +88,20 @@ pub fn read_all(path: &Path) -> io::Result<Vec<Segment>> {
     }
 
     Ok(segments)
+}
+
+// Row count for the history listing: streamed line scan matching the
+// record-type tag, not a full JSON parse of every record. Translation
+// records are excluded; the listing counts transcript rows.
+pub fn count_segment_lines(path: &Path) -> io::Result<usize> {
+    let reader = io::BufReader::new(File::open(path)?);
+    let mut count = 0;
+    for line in reader.lines() {
+        if line?.starts_with(r#"{"kind":"segment""#) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
