@@ -698,55 +698,22 @@ mod tests {
         assert!(debug.contains("<redacted>"));
     }
 
-    fn remove_line_starting_with(toml: &str, key: &str) -> String {
-        toml.lines()
-            .filter(|line| !line.trim_start().starts_with(key))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn remove_required_key(toml: &str, key: &str) -> String {
-        if !key.contains('.') && toml.lines().any(|line| line.trim() == format!("[{key}]")) {
-            let mut in_table = false;
-            let header = format!("[{key}]");
-            return toml
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    if trimmed == header {
-                        in_table = true;
-                        return false;
-                    }
-                    if in_table && trimmed.starts_with('[') {
-                        in_table = false;
-                    }
-                    !in_table
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+    // Deletes a (possibly dotted) key structurally instead of matching
+    // lines, so the fixture's exact formatting stops mattering.
+    fn remove_required_key(toml_str: &str, key: &str) -> String {
+        let mut value: toml::Value = toml::from_str(toml_str).unwrap();
+        match key.split_once('.') {
+            Some((parent, child)) => {
+                value
+                    .get_mut(parent)
+                    .and_then(|parent| parent.as_table_mut())
+                    .unwrap_or_else(|| panic!("fixture has no [{parent}] table"))
+                    .remove(child);
+            }
+            None => {
+                value.as_table_mut().unwrap().remove(key);
+            }
         }
-
-        if let Some((parent, child)) = key.split_once('.') {
-            let mut in_parent = false;
-            let header = format!("[{parent}]");
-            toml.lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    if trimmed == header {
-                        in_parent = true;
-                        return true;
-                    }
-                    if trimmed.starts_with('[') {
-                        in_parent = false;
-                    }
-                    !in_parent
-                        || !trimmed.starts_with(&format!("{child} "))
-                            && !trimmed.starts_with(&format!("{child}="))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            remove_line_starting_with(toml, key)
-        }
+        toml::to_string(&value).unwrap()
     }
 }

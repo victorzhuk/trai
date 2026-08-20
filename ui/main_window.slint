@@ -431,10 +431,25 @@ export component AppWindow inherits Window {
                 clicked => { root.stop-clicked(); }
             }
             // Appears only while stop() is draining: lets the user
-            // abandon waiting for dead translation backends.
-            if root.stopping: Button {
-                text: "Force stop";
-                clicked => { root.force-stop-clicked(); }
+            // abandon waiting for dead translation backends. Danger-
+            // leaning because in-flight work is discarded.
+            if root.stopping: Rectangle {
+                width: force-label.width + 24px;
+                height: 32px;
+                border-radius: 6px;
+                background: force-touch.pressed ? Theme.danger.darker(1.15) : Theme.danger.transparentize(0.25);
+
+                force-label := Text {
+                    text: "Force stop";
+                    color: #ffffff;
+                    font-size: 13px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+                force-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.force-stop-clicked(); }
+                }
             }
             Spacer { }
             if root.busy: HorizontalLayout {
