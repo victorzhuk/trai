@@ -12,6 +12,9 @@ monitor_source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
 # mic_language = "en"
 # monitor_language = "de"
 whisper_url = "http://localhost:9000"
+# Upper bound on one transcription request. A hung whisper server fails
+# the segment after this long instead of blocking recording stop.
+whisper_timeout_ms = 120000
 target_language = "en"
 vad_threshold = 0.5
 silence_hold_ms = 300
@@ -38,8 +41,10 @@ reprobe_interval_ms = 30000
 # Backends are tried in order. The first one that answers wins; if it
 # starts failing, translation falls over to the next and keeps retrying
 # the earlier ones in the background at reprobe_interval_ms.
+# Plain http:// is only accepted for loopback hosts; remote backends
+# must use https:// since the API key rides every request.
 [[translate.backends]]
-base_url = "http://192.168.1.50:1234"
+base_url = "https://192.168.1.50:1234"
 model = "qwen/qwen3.5-9b"
 # api_key = "optional-bearer-token"
 

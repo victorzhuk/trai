@@ -11,6 +11,7 @@ pub struct Config {
     pub mic_language: Option<String>,
     pub monitor_language: Option<String>,
     pub whisper_url: String,
+    pub whisper_timeout_ms: u64,
     pub target_language: String,
     pub translate: TranslateConfig,
     pub vad_threshold: f32,
@@ -74,6 +75,19 @@ fn invalid(key: &'static str, reason: impl Into<String>) -> ConfigError {
     }
 }
 
+// Bearer keys and raw meeting audio ride these URLs, so plain HTTP is
+// only tolerable when the bytes never leave the machine.
+fn cleartext_reason(url: &url::Url) -> Option<&'static str> {
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    (url.scheme() == "http" && !loopback)
+        .then_some("uses http:// with a non-loopback host; use https://")
+}
+
 fn require_non_blank(key: &'static str, value: String) -> Result<String, ConfigError> {
     if value.trim().is_empty() {
         Err(invalid(key, "must not be blank"))
@@ -92,6 +106,7 @@ struct RawConfig {
     mic_language: Option<String>,
     monitor_language: Option<String>,
     whisper_url: Option<String>,
+    whisper_timeout_ms: Option<u64>,
     target_language: Option<String>,
     translate: Option<RawTranslateConfig>,
     vad_threshold: Option<f32>,
@@ -157,12 +172,18 @@ fn parse_translate_config(raw: RawTranslateConfig) -> Result<TranslateConfig, Co
                 format!("entry {i}: base_url must not be blank"),
             ));
         }
-        reqwest::Url::parse(&base_url).map_err(|e| {
+        let parsed_url = url::Url::parse(&base_url).map_err(|e| {
             invalid(
                 "translate.backends",
                 format!("entry {i}: base_url is not a valid URL: {e}"),
             )
         })?;
+        if let Some(reason) = cleartext_reason(&parsed_url) {
+            return Err(invalid(
+                "translate.backends",
+                format!("entry {i}: base_url {reason}"),
+            ));
+        };
 
         let model = raw_backend.model.ok_or_else(|| {
             invalid(
@@ -210,6 +231,12 @@ impl Config {
             .monitor_source
             .ok_or(ConfigError::Missing("monitor_source"))?;
         let whisper_url = raw.whisper_url.ok_or(ConfigError::Missing("whisper_url"))?;
+        let whisper_timeout_ms = raw
+            .whisper_timeout_ms
+            .ok_or(ConfigError::Missing("whisper_timeout_ms"))?;
+        if whisper_timeout_ms == 0 {
+            return Err(invalid("whisper_timeout_ms", "must be greater than 0"));
+        }
         let target_language = require_non_blank(
             "target_language",
             raw.target_language
@@ -233,8 +260,11 @@ impl Config {
             .confidence_floor
             .ok_or(ConfigError::Missing("confidence_floor"))?;
 
-        reqwest::Url::parse(&whisper_url)
+        let whisper_url_parsed = url::Url::parse(&whisper_url)
             .map_err(|e| invalid("whisper_url", format!("not a valid URL: {e}")))?;
+        if let Some(reason) = cleartext_reason(&whisper_url_parsed) {
+            return Err(invalid("whisper_url", reason));
+        }
 
         if !(0.0..=1.0).contains(&confidence_floor) {
             return Err(invalid("confidence_floor", "must be within [0.0, 1.0]"));
@@ -259,6 +289,7 @@ impl Config {
             mic_language: raw.mic_language,
             monitor_language: raw.monitor_language,
             whisper_url,
+            whisper_timeout_ms,
             target_language,
             translate,
             vad_threshold,
@@ -282,6 +313,7 @@ mod tests {
             mic_language = "en"
             monitor_language = "de"
             whisper_url = "http://localhost:8080"
+            whisper_timeout_ms = 60000
             target_language = "en"
             vad_threshold = 0.5
             silence_hold_ms = 500
@@ -311,6 +343,7 @@ mod tests {
         assert_eq!(config.mic_language, Some("en".to_string()));
         assert_eq!(config.monitor_language, Some("de".to_string()));
         assert_eq!(config.whisper_url, "http://localhost:8080");
+        assert_eq!(config.whisper_timeout_ms, 60000);
         assert_eq!(config.target_language, "en");
         assert_eq!(config.translate.request_timeout_ms, 8000);
         assert_eq!(config.translate.reprobe_interval_ms, 30000);
@@ -334,7 +367,7 @@ mod tests {
             model = "gpt-4o-mini"
             api_key = "not-a-secret""#,
             r#"[[translate.backends]]
-            base_url = "http://lan-host:1234"
+            base_url = "https://lan-host:1234"
             model = "primary-model"
 
             [[translate.backends]]
@@ -348,7 +381,7 @@ mod tests {
         assert_eq!(config.translate.backends.len(), 2);
         assert_eq!(
             config.translate.backends[0].base_url,
-            "http://lan-host:1234"
+            "https://lan-host:1234"
         );
         assert_eq!(config.translate.backends[0].model, "primary-model");
         assert_eq!(config.translate.backends[0].api_key, None);
@@ -378,6 +411,7 @@ mod tests {
             mic_source = "alsa_input.default"
             monitor_source = "alsa_output.default.monitor"
             whisper_url = "http://localhost:8080"
+            whisper_timeout_ms = 60000
             target_language = "en"
             vad_threshold = 0.5
             silence_hold_ms = 500
@@ -413,6 +447,7 @@ mod tests {
             "mic_source",
             "monitor_source",
             "whisper_url",
+            "whisper_timeout_ms",
             "target_language",
             "translate",
             "translate.request_timeout_ms",
@@ -442,6 +477,7 @@ mod tests {
             mic_source = "alsa_input.default"
             monitor_source = "alsa_output.default.monitor"
             whisper_url = "http://localhost:8080"
+            whisper_timeout_ms = 60000
             target_language = "en"
             vad_threshold = 0.5
             silence_hold_ms = 500
@@ -468,6 +504,7 @@ mod tests {
             mic_source = "alsa_input.default"
             monitor_source = "alsa_output.default.monitor"
             whisper_url = "http://localhost:8080"
+            whisper_timeout_ms = 60000
             target_language = "en"
             vad_threshold = 0.5
             silence_hold_ms = 500
@@ -587,6 +624,54 @@ mod tests {
 
         let err = Config::from_toml_str(&toml).unwrap_err();
         assert!(err.to_string().contains("live_chunk_ms"));
+    }
+
+    #[test]
+    fn zero_whisper_timeout_ms_names_that_key_in_the_error() {
+        let toml = valid_toml().replace("whisper_timeout_ms = 60000", "whisper_timeout_ms = 0");
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("whisper_timeout_ms"));
+    }
+
+    #[test]
+    fn cleartext_remote_whisper_url_is_rejected_naming_the_key() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://whisper.example.com:8080""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("whisper_url"));
+        assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn loopback_and_tls_whisper_urls_are_accepted() {
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://whisper.example.com",
+        ] {
+            let toml = valid_toml().replace(
+                r#"whisper_url = "http://localhost:8080""#,
+                &format!(r#"whisper_url = "{url}""#),
+            );
+            assert!(Config::from_toml_str(&toml).is_ok(), "rejected {url}");
+        }
+    }
+
+    #[test]
+    fn cleartext_remote_translate_backend_is_rejected_naming_the_key() {
+        let toml = valid_toml().replace(
+            r#"base_url = "http://localhost:11434""#,
+            r#"base_url = "http://llm.example.com/v1""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("translate.backends"));
+        assert!(err.to_string().contains("https"));
     }
 
     fn remove_line_starting_with(toml: &str, key: &str) -> String {

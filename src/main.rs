@@ -164,6 +164,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_mic_language = config.mic_language.clone();
     let cfg_monitor_language = config.monitor_language.clone();
     let cfg_whisper_url = config.whisper_url.clone();
+    let cfg_whisper_timeout = Duration::from_millis(config.whisper_timeout_ms);
     let cfg_translate_backends = config.translate.backends.clone();
     let cfg_translate_request_timeout = Duration::from_millis(config.translate.request_timeout_ms);
     let cfg_translate_reprobe_interval =
@@ -318,19 +319,35 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 confidence_floor: cfg_confidence_floor,
             };
 
-            let transcriber: Arc<dyn Transcriber> = Arc::new(WhisperClient::new(&cfg_whisper_url));
+            let transcriber: Arc<dyn Transcriber> =
+                match WhisperClient::new(&cfg_whisper_url, cfg_whisper_timeout) {
+                    Ok(client) => Arc::new(client),
+                    Err(e) => {
+                        w.set_status_text(format!("start failed: {e}").into());
+                        return;
+                    }
+                };
             let translate_backends: Vec<Arc<dyn Translator>> = cfg_translate_backends
                 .iter()
-                .map(|backend: &TranslateBackendConfig| {
-                    Arc::new(OpenAITranslator::new(
+                .filter_map(|backend: &TranslateBackendConfig| {
+                    match OpenAITranslator::new(
                         &backend.base_url,
                         &backend.model,
                         &cfg_target_language,
                         backend.api_key.clone(),
                         cfg_translate_request_timeout,
-                    )) as Arc<dyn Translator>
+                    ) {
+                        Ok(translator) => Some(Arc::new(translator) as Arc<dyn Translator>),
+                        Err(e) => {
+                            w.set_status_text(format!("start failed: {e}").into());
+                            None
+                        }
+                    }
                 })
                 .collect();
+            if translate_backends.len() != cfg_translate_backends.len() {
+                return;
+            }
             let translator: Arc<dyn Translator> = Arc::new(FallbackTranslator::new(
                 translate_backends,
                 cfg_translate_reprobe_interval,

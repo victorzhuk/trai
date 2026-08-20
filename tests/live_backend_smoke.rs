@@ -40,13 +40,9 @@ fn unreachable_addr() -> String {
 }
 
 fn lm_studio_backend() -> std::sync::Arc<dyn Translator> {
-    std::sync::Arc::new(OpenAITranslator::new(
-        LM_STUDIO_URL,
-        LM_STUDIO_MODEL,
-        "es",
-        None,
-        REQUEST_TIMEOUT,
-    ))
+    std::sync::Arc::new(
+        OpenAITranslator::new(LM_STUDIO_URL, LM_STUDIO_MODEL, "es", None, REQUEST_TIMEOUT).unwrap(),
+    )
 }
 
 // Accepts `responses.len()` sequential connections on `addr` and replies
@@ -82,13 +78,16 @@ Connection: close\r\n\
 #[test]
 #[ignore]
 fn lan_unreachable_every_line_served_by_local_and_marked_degraded() {
-    let unreachable: std::sync::Arc<dyn Translator> = std::sync::Arc::new(OpenAITranslator::new(
-        unreachable_addr(),
-        "irrelevant-model",
-        "es",
-        None,
-        REQUEST_TIMEOUT,
-    ));
+    let unreachable: std::sync::Arc<dyn Translator> = std::sync::Arc::new(
+        OpenAITranslator::new(
+            unreachable_addr(),
+            "irrelevant-model",
+            "es",
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .unwrap(),
+    );
     let fallback = FallbackTranslator::new(
         vec![unreachable, lm_studio_backend()],
         Duration::from_secs(60),
@@ -114,13 +113,16 @@ fn lan_recovers_mid_recording_and_new_rows_stop_being_marked_within_one_reprobe_
     let primary_addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let primary: std::sync::Arc<dyn Translator> = std::sync::Arc::new(OpenAITranslator::new(
-        format!("http://{primary_addr}"),
-        "irrelevant-model",
-        "es",
-        None,
-        REQUEST_TIMEOUT,
-    ));
+    let primary: std::sync::Arc<dyn Translator> = std::sync::Arc::new(
+        OpenAITranslator::new(
+            format!("http://{primary_addr}"),
+            "irrelevant-model",
+            "es",
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .unwrap(),
+    );
     let reprobe_interval = Duration::from_secs(2);
     let fallback = FallbackTranslator::new(vec![primary, lm_studio_backend()], reprobe_interval);
 
@@ -164,14 +166,16 @@ fn lan_recovers_mid_recording_and_new_rows_stop_being_marked_within_one_reprobe_
 #[test]
 #[ignore]
 fn misconfigured_model_name_surfaces_error_without_demoting_backend() {
-    let bad_model_backend: std::sync::Arc<dyn Translator> =
-        std::sync::Arc::new(OpenAITranslator::new(
+    let bad_model_backend: std::sync::Arc<dyn Translator> = std::sync::Arc::new(
+        OpenAITranslator::new(
             OLLAMA_URL,
             "definitely-not-a-real-model",
             "es",
             None,
             REQUEST_TIMEOUT,
-        ));
+        )
+        .unwrap(),
+    );
     let fallback = FallbackTranslator::new(
         vec![bad_model_backend, lm_studio_backend()],
         Duration::from_secs(60),

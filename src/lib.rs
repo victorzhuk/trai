@@ -3,6 +3,7 @@ pub mod confidence;
 pub mod config;
 pub mod domain;
 pub mod history;
+mod http;
 pub mod language;
 pub mod log;
 pub mod pipeline;

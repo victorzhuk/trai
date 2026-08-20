@@ -22,18 +22,21 @@ impl OpenAITranslator {
         target_language: impl Into<String>,
         api_key: Option<String>,
         request_timeout: Duration,
-    ) -> Self {
+    ) -> Result<Self, TranslateError> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        Self {
+        let client = Client::builder()
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| {
+                TranslateError::misconfigured(format!("failed to build translate client: {e}"))
+            })?;
+        Ok(Self {
             base_url,
             model: model.into(),
             target_language: target_language.into(),
             api_key,
-            client: Client::builder()
-                .timeout(request_timeout)
-                .build()
-                .expect("failed to build reqwest blocking client for OpenAI"),
-        }
+            client,
+        })
     }
 
     pub(crate) fn build_request_payload(
@@ -97,7 +100,7 @@ impl Translator for OpenAITranslator {
             classify_status(status)(format!("translate request failed with status: {status}"))
         })?;
 
-        let raw_body = response.text().map_err(|e| {
+        let raw_body = crate::http::read_body(response).map_err(|e| {
             TranslateError::unavailable(format!("failed to read translate response: {e}"))
         })?;
 
@@ -192,7 +195,8 @@ Connection: close\r\n\
         response_body: &str,
     ) -> (OpenAITranslator, thread::JoinHandle<()>) {
         let (address, server) = serve_response(status_line, response_body);
-        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
         (translator, server)
     }
 
@@ -204,7 +208,8 @@ Connection: close\r\n\
             "es",
             None,
             TEST_TIMEOUT,
-        );
+        )
+        .expect("client build should succeed");
 
         assert_eq!(translator.base_url, "http://example.com");
     }
@@ -293,7 +298,8 @@ Connection: close\r\n\
     #[test]
     fn probe_success_on_2xx() {
         let (address, server) = serve_response("HTTP/1.1 200 OK", r#"{"data":[]}"#);
-        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
 
         translator.probe().expect("probe should succeed");
 
@@ -303,7 +309,8 @@ Connection: close\r\n\
     #[test]
     fn probe_failure_on_non_2xx_classifies_by_status() {
         let (address, server) = serve_response("HTTP/1.1 401 Unauthorized", r#"unauthorized"#);
-        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
 
         let err = translator.probe().expect_err("probe should fail");
         assert!(err.is_misconfigured());

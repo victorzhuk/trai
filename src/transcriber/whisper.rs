@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -18,11 +18,15 @@ pub struct WhisperClient {
 }
 
 impl WhisperClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
+    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, TranscribeError> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| TranscribeError::new(format!("failed to build whisper client: {e}")))?;
+        Ok(Self {
             base_url: base_url.into(),
-            client: reqwest::blocking::Client::new(),
-        }
+            client,
+        })
     }
 }
 
@@ -54,8 +58,7 @@ impl Transcriber for WhisperClient {
             .map_err(|e| TranscribeError::new(format!("whisper request failed: {e}")))?;
 
         let status = response.status();
-        let body = response
-            .text()
+        let body = crate::http::read_body(response)
             .map_err(|e| TranscribeError::new(format!("failed to read whisper response: {e}")))?;
 
         crate::debug!(
@@ -86,37 +89,27 @@ fn language_param(configured: Option<&str>) -> &str {
     }
 }
 
-/// Hand-rolled minimal PCM16 mono WAV container. `hound` isn't a
-/// dependency yet (it lands with the capture shell's file writing in
-/// a later task); pulling it in here just for an in-memory 44-byte
-/// header would be a dependency for a one-off, so this writes the
-/// RIFF/WAVE/fmt/data chunks directly instead.
 fn samples_to_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
-    const CHANNELS: u16 = 1;
-    const BITS_PER_SAMPLE: u16 = 16;
-
-    let data_len = (samples.len() * 2) as u32;
-    let byte_rate = sample_rate * CHANNELS as u32 * (BITS_PER_SAMPLE as u32 / 8);
-    let block_align = CHANNELS * (BITS_PER_SAMPLE / 8);
-
-    let mut wav = Vec::with_capacity(44 + data_len as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&CHANNELS.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    for sample in samples {
-        wav.extend_from_slice(&sample.to_le_bytes());
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::with_capacity(44 + samples.len() * 2));
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec)
+            .expect("writing WAV headers to memory cannot fail");
+        for sample in samples {
+            writer
+                .write_sample(*sample)
+                .expect("writing WAV samples to memory cannot fail");
+        }
+        writer
+            .finalize()
+            .expect("finalizing an in-memory WAV cannot fail");
     }
-    wav
+    cursor.into_inner()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -191,6 +184,34 @@ fn detected_language(parsed: &WhisperResponse) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn request_to_a_silent_server_times_out_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client =
+            WhisperClient::new(format!("http://{address}"), Duration::from_millis(250)).unwrap();
+
+        let began = Instant::now();
+        let err = client
+            .transcribe(&[0i16; SAMPLE_RATE_HZ as usize], None)
+            .expect_err("a server that never answers must fail the request");
+
+        assert!(began.elapsed() < Duration::from_secs(10));
+        assert!(err.to_string().contains("whisper request failed"));
+        drop(listener);
+    }
+
+    #[test]
+    fn samples_to_wav_produces_a_parseable_header() {
+        let wav = samples_to_wav(&[1i16, -2, 300], 16000);
+        let reader = hound::WavReader::new(std::io::Cursor::new(wav)).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, 16000);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        assert_eq!(reader.duration(), 3);
+    }
 
     #[test]
     fn parses_mean_confidence_from_verbose_json_words() {
