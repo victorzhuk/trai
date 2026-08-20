@@ -1,7 +1,9 @@
+#[cfg(any(test, feature = "test-doubles"))]
 pub mod fake;
 pub mod fallback;
 pub mod openai;
 
+#[cfg(any(test, feature = "test-doubles"))]
 pub use fake::FakeTranslator;
 pub use fallback::FallbackTranslator;
 pub use openai::OpenAITranslator;

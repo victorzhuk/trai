@@ -1,6 +1,11 @@
+// Test doubles compile only for unit tests or the integration-test
+// build (the `test-doubles` feature the dev-dependency enables), not
+// into the production binary.
+#[cfg(any(test, feature = "test-doubles"))]
 pub mod fake;
 pub mod whisper;
 
+#[cfg(any(test, feature = "test-doubles"))]
 pub use fake::FakeTranscriber;
 pub use whisper::WhisperClient;
 

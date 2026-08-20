@@ -5566,6 +5566,7 @@ dependencies = [
  "slint-build",
  "tempfile",
  "toml 0.8.23",
+ "trai",
  "url",
 ]
 

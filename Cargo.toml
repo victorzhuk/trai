@@ -21,8 +21,14 @@ slint = "1"
 toml = "0.8"
 url = "2"
 
+[features]
+# Enabled by the dev-dependency below so integration tests (and only
+# they) get the Fake transcriber/translator doubles.
+test-doubles = []
+
 [build-dependencies]
 slint-build = "1"
 
 [dev-dependencies]
 tempfile = "3"
+trai = { path = ".", features = ["test-doubles"] }
