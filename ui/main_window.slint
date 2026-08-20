@@ -29,20 +29,26 @@ export struct HistoryRow {
 }
 
 // Derived from Palette so the window follows the system light/dark scheme.
-// The two status hues are fixed rather than scheme-branched: Palette reports
-// ColorScheme.unknown when the scheme comes from the system, so branching on
-// it would silently pick light-scheme colors on a dark desktop.
+// `secondary` is the lowest-emphasis ink allowed for text: transparentize
+// factors below it fail WCAG AA at caption sizes on both schemes. `faint`
+// is decoration-only (hairlines, dividers), never text.
+//
+// Status hues branch on the scheme because no single red/amber passes AA
+// on both a near-white and a near-black background. When Palette reports
+// ColorScheme.unknown the light-scheme variant is chosen, matching the
+// historical behavior.
 //
 // `pad` and `gap` are shared by the card backdrop, the pane headers and every
 // transcript row: all three are laid out independently, and only identical
 // values keep the two columns on the same vertical edges.
 global Theme {
     out property <brush> muted: Palette.foreground.transparentize(0.4);
+    out property <brush> secondary: Palette.foreground.transparentize(0.35);
     out property <brush> faint: Palette.foreground.transparentize(0.65);
     out property <brush> hairline: Palette.foreground.transparentize(0.88);
     out property <brush> rule: Palette.foreground.transparentize(0.7);
-    out property <brush> danger: #ef4444;
-    out property <brush> warning: #d97706;
+    out property <brush> danger: Palette.color-scheme == ColorScheme.dark ? #f87171 : #dc2626;
+    out property <brush> warning: Palette.color-scheme == ColorScheme.dark ? #fbbf24 : #b45309;
     out property <length> pad: 12px;
     out property <length> gap: 12px;
     out property <length> inset: 14px;
@@ -150,7 +156,7 @@ component PaneHeader inherits Half {
             Text {
                 text: root.detail;
                 font-size: 11px;
-                color: Theme.faint;
+                color: Theme.secondary;
             }
         }
         Divider { }
@@ -229,7 +235,7 @@ component TranscriptLine inherits Rectangle {
                 body: root.entry.text;
                 italic: root.entry.transcribing;
                 ink: root.entry.text-failed ? Theme.danger
-                    : root.entry.transcribing ? Theme.faint
+                    : root.entry.transcribing ? Theme.secondary
                     : Palette.foreground;
             }
         }
@@ -241,6 +247,7 @@ component TranscriptLine inherits Rectangle {
                     : root.entry.degraded ? Theme.warning
                     : Theme.rule;
                 caption: root.entry.error ? "✕ translation failed"
+                    : root.entry.text-failed ? "no translation"
                     : root.entry.degraded ? "⚠ fallback backend"
                     : root.entry.verbatim ? "= same language"
                     : root.entry.pending ? "translating…"
@@ -252,7 +259,8 @@ component TranscriptLine inherits Rectangle {
                 body: root.entry.translation;
                 italic: root.entry.pending;
                 ink: root.entry.error ? Theme.danger
-                    : root.entry.pending ? Theme.faint
+                    : root.entry.text-failed ? Theme.secondary
+                    : root.entry.pending ? Theme.secondary
                     : root.entry.verbatim ? Theme.muted
                     : Palette.foreground;
             }
@@ -328,7 +336,7 @@ component TranscriptSplit inherits Rectangle {
 
             if root.rows.length == 0: Text {
                 text: root.empty-text;
-                color: Theme.faint;
+                color: Theme.secondary;
                 font-size: 13px;
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
@@ -370,6 +378,9 @@ export component AppWindow inherits Window {
     // recording is in flight.
     in property <bool> wizard-open: false;
     in-out property <string> wizard-title: "";
+    // Validation failures of the last begin attempt, shown inside the
+    // wizard card next to the fields, not only in the header.
+    in property <string> wizard-error: "";
     in-out property <[string]> mic-source-names;
     in-out property <int> mic-selected-index: 0;
     in-out property <[string]> monitor-source-names;
@@ -409,7 +420,9 @@ export component AppWindow inherits Window {
             Button {
                 text: "Start";
                 primary: true;
-                enabled: !root.busy;
+                // Disabled while the wizard is open: re-entering start
+                // would reset the wizard and wipe typed input.
+                enabled: !root.busy && !root.wizard-open;
                 clicked => { root.start-clicked(); }
             }
             Button {
@@ -432,13 +445,18 @@ export component AppWindow inherits Window {
                 if root.monitor-language != "": StatusChip {
                     label: "them " + root.monitor-language;
                 }
-                if root.pending-transcriptions > 0: StatusChip {
+                // Stable slots: the counting chips always render while
+                // busy, so the header does not reflow on 0-to-N
+                // transitions. Zero counts read as muted, not missing.
+                StatusChip {
                     label: "\{root.pending-transcriptions} transcribing";
-                    waiting: true;
+                    waiting: root.pending-transcriptions > 0;
+                    ink: root.pending-transcriptions > 0 ? Theme.secondary : Theme.muted;
                 }
-                if root.pending-translations > 0: StatusChip {
+                StatusChip {
                     label: "\{root.pending-translations} translating";
-                    waiting: true;
+                    waiting: root.pending-translations > 0;
+                    ink: root.pending-translations > 0 ? Theme.secondary : Theme.muted;
                 }
                 if root.failed-transcriptions > 0: StatusChip {
                     label: "\{root.failed-transcriptions} failed";
@@ -478,6 +496,7 @@ export component AppWindow inherits Window {
             // duration of source selection.
             if root.wizard-open && !root.busy: VerticalLayout {
                 alignment: center;
+                init => { title-edit.focus(); }
                 HorizontalLayout {
                     alignment: center;
                     Card {
@@ -493,9 +512,10 @@ export component AppWindow inherits Window {
                                 font-weight: 700;
                             }
                             Text { text: "Title"; font-size: 11px; color: Theme.muted; }
-                            LineEdit {
-                                placeholder-text: "Title";
+                            title-edit := LineEdit {
+                                placeholder-text: "e.g. Sprint review";
                                 text <=> root.wizard-title;
+                                accepted => { root.begin-clicked(); }
                             }
                             Text { text: "Microphone"; font-size: 11px; color: Theme.muted; }
                             ComboBox {
@@ -510,7 +530,13 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "Saving to " + root.store-root-display;
                                 font-size: 11px;
-                                color: Theme.faint;
+                                color: Theme.secondary;
+                                wrap: word-wrap;
+                            }
+                            if root.wizard-error != "": Text {
+                                text: root.wizard-error;
+                                color: Theme.danger;
+                                font-size: 12px;
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
@@ -523,6 +549,7 @@ export component AppWindow inherits Window {
                                 Button {
                                     text: "Begin";
                                     primary: true;
+                                    enabled: !root.busy;
                                     clicked => { root.begin-clicked(); }
                                 }
                             }
@@ -607,7 +634,7 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "\{root.history-rows.length} recordings";
                                 font-size: 11px;
-                                color: Theme.faint;
+                                color: Theme.secondary;
                             }
                         }
                         Divider { }
@@ -624,7 +651,12 @@ export component AppWindow inherits Window {
 
                                     for row[index] in root.history-rows: Rectangle {
                                         height: 48px;
-                                        background: touch.has-hover ? Palette.alternate-background : transparent;
+                                        background: touch.pressed ? Theme.hairline
+                                            : touch.has-hover || row-focus.has-focus ? Palette.alternate-background
+                                            : transparent;
+                                        border-width: row-focus.has-focus ? 1px : 0px;
+                                        border-color: Palette.accent-background;
+                                        border-radius: 4px;
 
                                         HorizontalLayout {
                                             padding-left: Theme.inset;
@@ -665,7 +697,7 @@ export component AppWindow inherits Window {
                                                 Text {
                                                     text: "\{row.line-count} lines";
                                                     font-size: 12px;
-                                                    color: Theme.faint;
+                                                    color: Theme.secondary;
                                                     width: 72px;
                                                     horizontal-alignment: right;
                                                 }
@@ -676,10 +708,27 @@ export component AppWindow inherits Window {
                                             y: parent.height - 1px;
                                         }
 
+                                        row-focus := FocusScope {
+                                            width: parent.width;
+                                            height: parent.height;
+                                            key-pressed(event) => {
+                                                if (event.text == Key.Return || event.text == Key.Space) {
+                                                    root.history-clicked(index);
+                                                    accept
+                                                } else {
+                                                    reject
+                                                }
+                                            }
+                                        }
+
                                         touch := TouchArea {
                                             width: parent.width;
                                             height: parent.height;
-                                            clicked => { root.history-clicked(index); }
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                row-focus.focus();
+                                                root.history-clicked(index);
+                                            }
                                         }
                                     }
                                 }
@@ -687,7 +736,7 @@ export component AppWindow inherits Window {
 
                             if root.history-rows.length == 0: Text {
                                 text: "No recordings yet — press Start to make one.";
-                                color: Theme.faint;
+                                color: Theme.secondary;
                                 font-size: 13px;
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
@@ -700,45 +749,83 @@ export component AppWindow inherits Window {
     }
 
     // Delete confirmation, drawn over the whole window so the list behind it
-    // cannot be clicked while it is open.
+    // cannot be clicked while it is open. Escape dismisses it like Cancel,
+    // Cancel has initial focus, and Tab is trapped on it.
     if root.delete-confirmation-open: Rectangle {
         background: #00000099;
         TouchArea { }
+        init => { cancel-button.focus(); }
 
-        VerticalLayout {
-            alignment: center;
-            HorizontalLayout {
+        delete-scope := FocusScope {
+            width: 100%;
+            height: 100%;
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.cancel-delete-clicked();
+                    accept
+                } else if (event.text == Key.Tab || event.text == Key.Backtab) {
+                    // Only Cancel is focusable inside the dialog, so
+                    // refocusing it on Tab keeps keyboard focus trapped
+                    // here instead of wandering to the content behind.
+                    cancel-button.focus();
+                    accept
+                } else {
+                    reject
+                }
+            }
+
+            VerticalLayout {
                 alignment: center;
-                Card {
-                    width: 420px;
-                    background: Palette.background;
+                HorizontalLayout {
+                    alignment: center;
+                    Card {
+                        width: 420px;
+                        background: Palette.background;
 
-                    VerticalLayout {
-                        padding: 20px;
-                        spacing: 12px;
+                        VerticalLayout {
+                            padding: 20px;
+                            spacing: 12px;
 
-                        Text {
-                            text: "Delete \"" + root.delete-target-name + "\"?";
-                            font-size: 15px;
-                            font-weight: 700;
-                            wrap: word-wrap;
-                        }
-                        Text {
-                            text: "This removes its transcript and audio, and cannot be undone.";
-                            font-size: 12px;
-                            color: Theme.muted;
-                            wrap: word-wrap;
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            alignment: end;
-                            Button {
-                                text: "Cancel";
-                                clicked => { root.cancel-delete-clicked(); }
+                            Text {
+                                text: "Delete \"" + root.delete-target-name + "\"?";
+                                font-size: 15px;
+                                font-weight: 700;
+                                wrap: word-wrap;
                             }
-                            Button {
-                                text: "Delete";
-                                clicked => { root.confirm-delete-clicked(); }
+                            Text {
+                                text: "This removes its transcript and audio, and cannot be undone.";
+                                font-size: 12px;
+                                color: Theme.muted;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                cancel-button := Button {
+                                    text: "Cancel";
+                                    clicked => { root.cancel-delete-clicked(); }
+                                }
+                                // Custom-styled instead of Button so the
+                                // irreversible action reads as dangerous.
+                                Rectangle {
+                                    width: delete-label.width + 24px;
+                                    height: 32px;
+                                    border-radius: 6px;
+                                    background: delete-touch.pressed ? Theme.danger.darker(1.15) : Theme.danger;
+
+                                    delete-label := Text {
+                                        text: "Delete";
+                                        color: #ffffff;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    delete-touch := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.confirm-delete-clicked(); }
+                                    }
+                                }
                             }
                         }
                     }

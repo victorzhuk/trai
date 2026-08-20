@@ -233,6 +233,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 w.set_mic_selected_index(mic_selected);
                 w.set_monitor_selected_index(monitor_selected);
                 w.set_store_root_display(cfg_store_root.display().to_string().into());
+                w.set_wizard_error("".into());
                 w.set_wizard_open(true);
             }
         });
@@ -252,6 +253,12 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 None => return,
             };
 
+            // Reentrancy guard: a second begin while a Recording is
+            // active (or still starting) is refused outright.
+            if recording_slot.borrow().is_some() {
+                return;
+            }
+
             let mic_names: ModelRc<slint::SharedString> = w.get_mic_source_names();
             let monitor_names: ModelRc<slint::SharedString> = w.get_monitor_source_names();
             let mic_index = w.get_mic_selected_index();
@@ -263,6 +270,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             {
                 Some(name) => name.to_string(),
                 None => {
+                    w.set_wizard_error("select a microphone source".into());
                     w.set_status_text("select a microphone source".into());
                     return;
                 }
@@ -273,10 +281,12 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             {
                 Some(name) => name.to_string(),
                 None => {
+                    w.set_wizard_error("select a monitor source".into());
                     w.set_status_text("select a monitor source".into());
                     return;
                 }
             };
+            w.set_wizard_error("".into());
 
             let title = {
                 let t = w.get_wizard_title().to_string();
