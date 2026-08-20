@@ -345,6 +345,97 @@ component TranscriptSplit inherits Rectangle {
     }
 }
 
+// Modal confirmation with keyboard safety: Cancel has initial focus,
+// Escape dismisses, Tab is trapped on Cancel, and the destructive
+// confirm action is styled as dangerous. The content behind is covered
+// by a full-window TouchArea, so it cannot be clicked either.
+component ConfirmDialog inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    in property <string> confirm-label;
+    callback confirmed();
+    callback dismissed();
+
+    background: #00000099;
+    TouchArea { }
+    init => { cancel-button.focus(); }
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.dismissed();
+                accept
+            } else if (event.text == Key.Tab || event.text == Key.Backtab) {
+                // Only Cancel is focusable inside the dialog, so
+                // refocusing it on Tab keeps keyboard focus trapped
+                // here instead of wandering to the content behind.
+                cancel-button.focus();
+                accept
+            } else {
+                reject
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Card {
+                    width: 420px;
+                    background: Palette.background;
+
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 12px;
+
+                        Text {
+                            text: root.title;
+                            font-size: 15px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.body;
+                            font-size: 12px;
+                            color: Theme.muted;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: end;
+                            cancel-button := Button {
+                                text: "Cancel";
+                                clicked => { root.dismissed(); }
+                            }
+                            Rectangle {
+                                width: confirm-label-text.width + 24px;
+                                height: 32px;
+                                border-radius: 6px;
+                                background: confirm-touch.pressed ? Theme.danger.darker(1.15) : Theme.danger;
+
+                                confirm-label-text := Text {
+                                    text: root.confirm-label;
+                                    color: #ffffff;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                confirm-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.confirmed(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "trai";
     preferred-width: 1040px;
@@ -396,10 +487,14 @@ export component AppWindow inherits Window {
     in property <string> replay-title: "";
     in property <bool> delete-confirmation-open: false;
     in property <string> delete-target-name: "";
+    in property <bool> force-stop-confirmation-open: false;
+    in property <int> force-stop-pending-count: 0;
 
     callback start-clicked();
     callback stop-clicked();
     callback force-stop-clicked();
+    callback confirm-force-stop-clicked();
+    callback cancel-force-stop-clicked();
     callback begin-clicked();
     callback cancel-wizard-clicked();
     callback history-clicked(int);
@@ -763,89 +858,23 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Delete confirmation, drawn over the whole window so the list behind it
-    // cannot be clicked while it is open. Escape dismisses it like Cancel,
-    // Cancel has initial focus, and Tab is trapped on it.
-    if root.delete-confirmation-open: Rectangle {
-        background: #00000099;
-        TouchArea { }
-        init => { cancel-button.focus(); }
+    // Delete confirmation: covers the window so the list behind cannot
+    // be clicked while it is open.
+    if root.delete-confirmation-open: ConfirmDialog {
+        title: "Delete \"" + root.delete-target-name + "\"?";
+        body: "This removes its transcript and audio, and cannot be undone.";
+        confirm-label: "Delete";
+        confirmed => { root.confirm-delete-clicked(); }
+        dismissed => { root.cancel-delete-clicked(); }
+    }
 
-        delete-scope := FocusScope {
-            width: 100%;
-            height: 100%;
-            key-pressed(event) => {
-                if (event.text == Key.Escape) {
-                    root.cancel-delete-clicked();
-                    accept
-                } else if (event.text == Key.Tab || event.text == Key.Backtab) {
-                    // Only Cancel is focusable inside the dialog, so
-                    // refocusing it on Tab keeps keyboard focus trapped
-                    // here instead of wandering to the content behind.
-                    cancel-button.focus();
-                    accept
-                } else {
-                    reject
-                }
-            }
-
-            VerticalLayout {
-                alignment: center;
-                HorizontalLayout {
-                    alignment: center;
-                    Card {
-                        width: 420px;
-                        background: Palette.background;
-
-                        VerticalLayout {
-                            padding: 20px;
-                            spacing: 12px;
-
-                            Text {
-                                text: "Delete \"" + root.delete-target-name + "\"?";
-                                font-size: 15px;
-                                font-weight: 700;
-                                wrap: word-wrap;
-                            }
-                            Text {
-                                text: "This removes its transcript and audio, and cannot be undone.";
-                                font-size: 12px;
-                                color: Theme.muted;
-                                wrap: word-wrap;
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: end;
-                                cancel-button := Button {
-                                    text: "Cancel";
-                                    clicked => { root.cancel-delete-clicked(); }
-                                }
-                                // Custom-styled instead of Button so the
-                                // irreversible action reads as dangerous.
-                                Rectangle {
-                                    width: delete-label.width + 24px;
-                                    height: 32px;
-                                    border-radius: 6px;
-                                    background: delete-touch.pressed ? Theme.danger.darker(1.15) : Theme.danger;
-
-                                    delete-label := Text {
-                                        text: "Delete";
-                                        color: #ffffff;
-                                        font-size: 13px;
-                                        font-weight: 700;
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2;
-                                    }
-                                    delete-touch := TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => { root.confirm-delete-clicked(); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Force-stop confirmation, shown only when in-flight work would be
+    // discarded; with nothing in flight the button applies immediately.
+    if root.force-stop-confirmation-open: ConfirmDialog {
+        title: "Discard in-flight work?";
+        body: "\{root.force-stop-pending-count} segments still transcribing, translating, or failed will be abandoned. This cannot be undone.";
+        confirm-label: "Discard";
+        confirmed => { root.confirm-force-stop-clicked(); }
+        dismissed => { root.cancel-force-stop-clicked(); }
     }
 }

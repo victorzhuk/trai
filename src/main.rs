@@ -506,13 +506,56 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
 
     {
         let force_stop_pipeline_slot = force_stop_pipeline.clone();
+        let window_weak = window.as_weak();
         window.on_force_stop_clicked(move || {
+            let pending = window_weak
+                .upgrade()
+                .map(|w| {
+                    w.get_pending_transcriptions()
+                        + w.get_pending_translations()
+                        + w.get_failed_transcriptions()
+                })
+                .unwrap_or(0);
+            if pending > 0 {
+                // In-flight work would be discarded: confirm first.
+                if let Some(w) = window_weak.upgrade() {
+                    w.set_force_stop_pending_count(pending);
+                    w.set_force_stop_confirmation_open(true);
+                }
+                return;
+            }
             if let Some(p) = force_stop_pipeline_slot
                 .lock()
                 .expect("force-stop slot mutex poisoned")
                 .as_ref()
             {
                 p.signal_force_stop();
+            }
+        });
+    }
+
+    {
+        let force_stop_pipeline_slot = force_stop_pipeline.clone();
+        let window_weak = window.as_weak();
+        window.on_confirm_force_stop_clicked(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_force_stop_confirmation_open(false);
+            }
+            if let Some(p) = force_stop_pipeline_slot
+                .lock()
+                .expect("force-stop slot mutex poisoned")
+                .as_ref()
+            {
+                p.signal_force_stop();
+            }
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        window.on_cancel_force_stop_clicked(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.set_force_stop_confirmation_open(false);
             }
         });
     }
@@ -650,5 +693,85 @@ mod tests {
         // 2024-02-29 23:59 UTC (leap day) and 2000-01-01 00:00 UTC.
         assert_eq!(format_timestamp(1_709_251_140), "2024-02-29 23:59");
         assert_eq!(format_timestamp(946_684_800), "2000-01-01 00:00");
+    }
+}
+
+#[cfg(test)]
+mod row_shape_tests {
+    use super::*;
+    use trai::domain::{SegmentState, SpeakerTag};
+
+    fn segment(state: SegmentState) -> Segment {
+        Segment {
+            id: 1,
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            text: "hello".to_string(),
+            mean_confidence: 0.9,
+            source_language: None,
+            translation: None,
+            degraded: false,
+            state,
+            translation_error: None,
+        }
+    }
+
+    #[test]
+    fn transcribing_row_sets_only_transcribing_and_pending() {
+        let row = to_ui_row(&segment(SegmentState::Transcribing), "en");
+        assert!(row.transcribing);
+        assert!(row.pending);
+        assert!(!row.text_failed && !row.verbatim && !row.degraded && !row.error);
+    }
+
+    #[test]
+    fn failed_transcription_row_marks_text_failed_and_absent_translation() {
+        let row = to_ui_row(
+            &segment(SegmentState::Failed("whisper returned 503".to_string())),
+            "en",
+        );
+        assert!(row.text_failed);
+        assert!(!row.pending && !row.transcribing && !row.error);
+        assert_eq!(row.text, "whisper returned 503");
+        assert_eq!(row.translation, "—");
+    }
+
+    #[test]
+    fn translated_row_carries_degraded_flag() {
+        let mut seg = segment(SegmentState::Ready);
+        seg.translation = Some("hola".to_string());
+        seg.degraded = true;
+        let row = to_ui_row(&seg, "en");
+        assert_eq!(row.translation, "hola");
+        assert!(row.degraded);
+        assert!(!row.pending && !row.error && !row.verbatim);
+    }
+
+    #[test]
+    fn translation_error_row_sets_error_with_the_message() {
+        let mut seg = segment(SegmentState::Ready);
+        seg.translation_error = Some("model 'x' not found".to_string());
+        let row = to_ui_row(&seg, "en");
+        assert!(row.error);
+        assert_eq!(row.translation, "model 'x' not found");
+        assert!(!row.pending && !row.degraded);
+    }
+
+    #[test]
+    fn same_language_row_is_verbatim_not_pending() {
+        let mut seg = segment(SegmentState::Ready);
+        seg.source_language = Some("en".to_string());
+        let row = to_ui_row(&seg, "en");
+        assert!(row.verbatim);
+        assert!(!row.pending);
+        assert_eq!(row.translation, "hello");
+    }
+
+    #[test]
+    fn ready_row_without_translation_is_pending() {
+        let row = to_ui_row(&segment(SegmentState::Ready), "en");
+        assert!(row.pending);
+        assert!(!row.verbatim && !row.error && !row.degraded);
     }
 }
