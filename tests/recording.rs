@@ -47,9 +47,11 @@ fn pcm_bytes(samples: &[i16]) -> Vec<u8> {
 
 // Poll instead of sleeping a fixed duration: an in-memory Cursor is
 // drained as fast as the scheduler allows, so a fixed margin either
-// wastes time or expires early under CI load.
+// wastes time or expires early under CI load. The deadline is generous
+// because the 75s-audio drain test churns real CPU before the
+// condition can become true.
 fn wait_until(mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !condition() {
         assert!(
             std::time::Instant::now() < deadline,

@@ -4,7 +4,7 @@ use crate::language;
 use crate::store::{Record, Store};
 use crate::transcriber::{TranscribeError, Transcriber};
 use crate::translator::Translator;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -73,6 +73,9 @@ struct Persisted {
     // built on it keeps rows after they've been flushed to disk and
     // dropped from `transcript`.
     live_view: Vec<Segment>,
+    // live_view indices by Segment id: every lookup below used to be a
+    // linear scan over a Vec that grows for the whole meeting.
+    row_index: HashMap<u64, usize>,
     // start_ms -> count of segments currently between opening (or, for
     // callers with no separate open phase, submitting) and completing
     // their transcribe() call, keyed by start_ms (not id) so
@@ -119,29 +122,47 @@ impl Persisted {
     // start_ms cannot have changed since, so filling it in place keeps
     // live_view sorted without re-inserting.
     fn replace_live_row(&mut self, segment: Segment) {
-        if let Some(row) = self.live_view.iter_mut().find(|row| row.id == segment.id) {
-            *row = segment;
+        if let Some(&position) = self.row_index.get(&segment.id) {
+            self.live_view[position] = segment;
             return;
         }
-        insert_ordered(&mut self.live_view, segment);
+        self.insert_live_row(segment);
+    }
+
+    // Sorted insert that keeps row_index valid: everything at or past
+    // the insertion point shifts by one.
+    fn insert_live_row(&mut self, segment: Segment) {
+        let position = self
+            .live_view
+            .partition_point(|existing| existing.start_ms <= segment.start_ms);
+        for index in self.row_index.values_mut() {
+            if *index >= position {
+                *index += 1;
+            }
+        }
+        self.row_index.insert(segment.id, position);
+        self.live_view.insert(position, segment);
     }
 
     fn fail_live_row(&mut self, segment_id: u64, message: String) {
-        if let Some(row) = self.live_view.iter_mut().find(|row| row.id == segment_id) {
-            row.state = SegmentState::Failed(message);
+        if let Some(&position) = self.row_index.get(&segment_id) {
+            self.live_view[position].state = SegmentState::Failed(message);
         }
     }
 
     fn drop_live_row(&mut self, segment_id: u64) {
-        self.live_view.retain(|row| row.id != segment_id);
+        if let Some(position) = self.row_index.remove(&segment_id) {
+            self.live_view.remove(position);
+            for index in self.row_index.values_mut() {
+                if *index > position {
+                    *index -= 1;
+                }
+            }
+        }
     }
 
     fn translation_context(&self, segment_id: u64, target_language: &str) -> Vec<String> {
-        let Some(position) = self
-            .live_view
-            .iter()
-            .position(|segment| segment.id == segment_id)
-        else {
+        let Some(&position) = self.row_index.get(&segment_id) else {
             return Vec::new();
         };
 
@@ -235,6 +256,7 @@ impl Pipeline {
                 transcript: Vec::new(),
                 live_view: Vec::new(),
                 in_flight: BTreeMap::new(),
+                row_index: HashMap::new(),
             })),
             store: Arc::new(Mutex::new(store)),
             on_update: Arc::new(Mutex::new(None)),
@@ -279,22 +301,19 @@ impl Pipeline {
 
         let snapshot = {
             let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
-            insert_ordered(
-                &mut persisted.live_view,
-                Segment {
-                    id: segment_id,
-                    speaker_tag: input.speaker_tag,
-                    start_ms: input.start_ms,
-                    end_ms: input.end_ms,
-                    text: String::new(),
-                    mean_confidence: 0.0,
-                    source_language: configured_language.clone(),
-                    translation: None,
-                    degraded: false,
-                    state: SegmentState::Transcribing,
-                    translation_error: None,
-                },
-            );
+            persisted.insert_live_row(Segment {
+                id: segment_id,
+                speaker_tag: input.speaker_tag,
+                start_ms: input.start_ms,
+                end_ms: input.end_ms,
+                text: String::new(),
+                mean_confidence: 0.0,
+                source_language: configured_language.clone(),
+                translation: None,
+                degraded: false,
+                state: SegmentState::Transcribing,
+                translation_error: None,
+            });
             persisted.live_view.clone()
         };
         self.fire_update(snapshot);
@@ -551,7 +570,7 @@ impl Pipeline {
     ) -> Result<(), PipelineError> {
         {
             let persisted = persisted.lock().expect("pipeline mutex poisoned");
-            if !persisted.live_view.iter().any(|s| s.id == segment_id) {
+            if !persisted.row_index.contains_key(&segment_id) {
                 return Ok(());
             }
         }
@@ -595,15 +614,11 @@ impl Pipeline {
     ) -> Result<(), PipelineError> {
         let snapshot = {
             let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
-            let Some(row) = persisted
-                .live_view
-                .iter_mut()
-                .find(|segment| segment.id == segment_id)
-            else {
+            let Some(&position) = persisted.row_index.get(&segment_id) else {
                 return Ok(());
             };
 
-            mutate(row);
+            mutate(&mut persisted.live_view[position]);
             persisted.live_view.clone()
         };
 
@@ -977,8 +992,7 @@ mod tests {
             .persisted
             .lock()
             .expect("pipeline mutex poisoned")
-            .live_view
-            .push(Segment {
+            .insert_live_row(Segment {
                 id: 1,
                 speaker_tag: SpeakerTag::Me,
                 start_ms: 0,
