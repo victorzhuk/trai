@@ -614,3 +614,20 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
 
     window.run()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::format_timestamp;
+
+    #[test]
+    fn epoch_start_formats_as_midnight() {
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00");
+    }
+
+    #[test]
+    fn known_timestamps_format_correctly() {
+        // 2024-02-29 23:59 UTC (leap day) and 2000-01-01 00:00 UTC.
+        assert_eq!(format_timestamp(1_709_251_140), "2024-02-29 23:59");
+        assert_eq!(format_timestamp(946_684_800), "2000-01-01 00:00");
+    }
+}

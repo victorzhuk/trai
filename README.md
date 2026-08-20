@@ -46,8 +46,8 @@ make build
 
 # Create your config from the template
 make config
-# Edit config.toml: set store_root, sources, whisper_url, target_language,
-# and your translation backends
+# Edit config.toml: set store_root, sources, whisper_url, whisper_timeout_ms,
+# target_language, and your translation backends
 
 # Run
 make run
