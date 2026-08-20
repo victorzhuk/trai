@@ -8,6 +8,7 @@ pub mod language;
 pub mod log;
 pub mod pipeline;
 pub mod recording;
+mod scheduler;
 pub mod segmenter;
 pub mod store;
 pub mod transcriber;

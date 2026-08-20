@@ -1,16 +1,14 @@
 use crate::confidence::passes_floor;
 use crate::domain::{insert_ordered, Segment, SegmentState, SpeakerTag};
 use crate::language;
+use crate::scheduler::TranslationScheduler;
 use crate::store::{Record, Store};
 use crate::transcriber::{TranscribeError, Transcriber};
 use crate::translator::Translator;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 pub struct SegmentInput {
     pub speaker_tag: SpeakerTag,
@@ -18,28 +16,6 @@ pub struct SegmentInput {
     pub end_ms: u64,
     pub samples: Vec<i16>,
     pub language: Option<String>,
-}
-
-// How often drain_translations wakes to check force-stop while waiting
-// on the translation worker to settle the queue.
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-struct TranslationJob {
-    segment_id: u64,
-    text: String,
-}
-
-// Decrements the outstanding-translation counter and wakes
-// drain_translations when a job settles, even on panic.
-struct TranslationSettled<'a>(&'a Arc<(Mutex<usize>, Condvar)>);
-
-impl Drop for TranslationSettled<'_> {
-    fn drop(&mut self) {
-        let (lock, cvar) = &**self.0;
-        let mut outstanding = lock.lock().expect("translation count mutex poisoned");
-        *outstanding -= 1;
-        cvar.notify_all();
-    }
 }
 
 #[derive(Debug)]
@@ -71,7 +47,7 @@ impl From<std::io::Error> for PipelineError {
     }
 }
 
-struct Persisted {
+pub(crate) struct Persisted {
     // Holds only segments not yet written to store, kept sorted by
     // start_ms via insert_ordered. A segment that completes out of
     // order sits here until every still-in-flight submission with a
@@ -180,7 +156,27 @@ impl Persisted {
         Some(position)
     }
 
-    fn translation_context(&self, segment_id: u64, target_language: &str) -> Vec<String> {
+    pub(crate) fn contains_row(&self, segment_id: u64) -> bool {
+        self.row_index.contains_key(&segment_id)
+    }
+
+    // Applies `mutate` to the row and returns its index plus a fresh
+    // clone for the update callback; None when the row is gone.
+    pub(crate) fn mutate_row(
+        &mut self,
+        segment_id: u64,
+        mutate: impl FnOnce(&mut Segment),
+    ) -> Option<(usize, Segment)> {
+        let &index = self.row_index.get(&segment_id)?;
+        mutate(&mut self.live_view[index]);
+        Some((index, self.live_view[index].clone()))
+    }
+
+    pub(crate) fn translation_context(
+        &self,
+        segment_id: u64,
+        target_language: &str,
+    ) -> Vec<String> {
         let Some(&position) = self.row_index.get(&segment_id) else {
             return Vec::new();
         };
@@ -267,7 +263,7 @@ pub enum TranscriptUpdate {
 }
 
 // Fired (off the Pipeline's internal locks) with each live-view change.
-type TranscriptUpdateCallback = Box<dyn Fn(TranscriptUpdate) + Send + Sync>;
+pub(crate) type TranscriptUpdateCallback = Box<dyn Fn(TranscriptUpdate) + Send + Sync>;
 
 /// Turns Segments into transcribed, ordered, persisted ones. Callers
 /// with a distinct open-span phase should call `begin` the instant a
@@ -288,13 +284,7 @@ pub struct Pipeline {
     // state lock is held. Lock order is always store -> persisted.
     store: Arc<Mutex<dyn SegmentSink>>,
     on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-    translation_tx: Sender<TranslationJob>,
-    // Queued plus running translation jobs; drain_translations waits on
-    // the condvar until this reaches zero. One worker thread drains the
-    // queue in FIFO order, which replaces the old thread-per-segment
-    // chain: a dead backend now blocks exactly one thread, not one per
-    // queued Segment.
-    translations_in_flight: Arc<(Mutex<usize>, Condvar)>,
+    scheduler: TranslationScheduler,
     // Set by `signal_force_stop` so `drain_translations` stops waiting
     // for translation threads and detaches them instead. The threads
     // keep running in the background and finish on their own; the
@@ -319,28 +309,13 @@ impl Pipeline {
         }));
         let store: Arc<Mutex<dyn SegmentSink>> = Arc::new(Mutex::new(sink));
         let on_update = Arc::new(Mutex::new(None));
-        let (translation_tx, translation_rx) = channel();
-        let translations_in_flight = Arc::new((Mutex::new(0usize), Condvar::new()));
-
-        thread::spawn({
-            let translator = translator.clone();
-            let persisted = persisted.clone();
-            let store = store.clone();
-            let on_update = on_update.clone();
-            let target_language = target_language.clone();
-            let translations_in_flight = translations_in_flight.clone();
-            move || {
-                Self::translation_worker(
-                    translation_rx,
-                    translator,
-                    persisted,
-                    store,
-                    on_update,
-                    target_language,
-                    translations_in_flight,
-                );
-            }
-        });
+        let scheduler = TranslationScheduler::new(
+            translator,
+            persisted.clone(),
+            store.clone(),
+            on_update.clone(),
+            target_language.clone(),
+        );
 
         Self {
             transcriber,
@@ -350,8 +325,7 @@ impl Pipeline {
             persisted,
             store,
             on_update,
-            translation_tx,
-            translations_in_flight,
+            scheduler,
             force_stop: AtomicBool::new(false),
         }
     }
@@ -504,7 +478,7 @@ impl Pipeline {
         }
 
         if let Some((segment_id, text)) = translation_job {
-            self.dispatch_translation(segment_id, text);
+            self.scheduler.schedule(segment_id, text);
         }
 
         Ok(())
@@ -545,179 +519,7 @@ impl Pipeline {
     }
 
     pub fn drain_translations(&self) {
-        let (lock, cvar) = &*self.translations_in_flight;
-        let mut outstanding = lock.lock().expect("translation count mutex poisoned");
-        loop {
-            if *outstanding == 0 {
-                return;
-            }
-            if self.force_stop.load(Ordering::Relaxed) {
-                crate::debug!(
-                    "drain_translations: force-stop signaled, detaching queued translations"
-                );
-                return;
-            }
-            let (guard, _) = cvar
-                .wait_timeout(outstanding, DRAIN_POLL_INTERVAL)
-                .expect("translation count mutex poisoned");
-            outstanding = guard;
-        }
-    }
-
-    fn dispatch_translation(&self, segment_id: u64, text: String) {
-        {
-            let (lock, _) = &*self.translations_in_flight;
-            *lock.lock().expect("translation count mutex poisoned") += 1;
-        }
-        if self
-            .translation_tx
-            .send(TranslationJob { segment_id, text })
-            .is_err()
-        {
-            // The worker is gone, which cannot happen while the Pipeline
-            // lives; if it ever does, don't leave drain_translations
-            // waiting on a job that will never finish.
-            let (lock, cvar) = &*self.translations_in_flight;
-            let mut outstanding = lock.lock().expect("translation count mutex poisoned");
-            *outstanding -= 1;
-            cvar.notify_all();
-        }
-    }
-
-    // One worker, FIFO order: the same serial translation order the
-    // channel chain enforced, with exactly one thread no matter how
-    // many Segments queue up behind a slow or dead backend.
-    fn translation_worker(
-        rx: Receiver<TranslationJob>,
-        translator: Arc<dyn Translator>,
-        persisted: Arc<Mutex<Persisted>>,
-        store: Arc<Mutex<dyn SegmentSink>>,
-        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-        target_language: String,
-        translations_in_flight: Arc<(Mutex<usize>, Condvar)>,
-    ) {
-        while let Ok(job) = rx.recv() {
-            // Decrements the counter and wakes drain_translations even
-            // if the job panics mid-flight.
-            let _settled = TranslationSettled(&translations_in_flight);
-
-            let context = {
-                let persisted = persisted.lock().expect("pipeline mutex poisoned");
-                persisted.translation_context(job.segment_id, &target_language)
-            };
-
-            let began = Instant::now();
-            match translator.translate(&job.text, &context) {
-                Ok(translation) => {
-                    crate::debug!(
-                        "translate: segment {} ok in {:.2}s{} \"{}\"",
-                        job.segment_id,
-                        began.elapsed().as_secs_f64(),
-                        if translation.degraded {
-                            " (degraded)"
-                        } else {
-                            ""
-                        },
-                        crate::log::preview(&translation.text, 60),
-                    );
-                    if let Err(e) = Self::record_translation(
-                        persisted.clone(),
-                        store.clone(),
-                        on_update.clone(),
-                        job.segment_id,
-                        translation.text,
-                        translation.degraded,
-                    ) {
-                        crate::debug!("translation persist failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    crate::debug!(
-                        "translate: segment {} failed after {:.2}s: {e}",
-                        job.segment_id,
-                        began.elapsed().as_secs_f64()
-                    );
-                    if e.is_misconfigured() {
-                        if let Err(store_err) = Self::record_translation_error(
-                            persisted.clone(),
-                            on_update.clone(),
-                            job.segment_id,
-                            e.to_string(),
-                        ) {
-                            crate::debug!("translation error persist failed: {store_err}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn record_translation(
-        persisted: Arc<Mutex<Persisted>>,
-        store: Arc<Mutex<dyn SegmentSink>>,
-        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-        segment_id: u64,
-        text: String,
-        degraded: bool,
-    ) -> Result<(), PipelineError> {
-        {
-            let persisted = persisted.lock().expect("pipeline mutex poisoned");
-            if !persisted.row_index.contains_key(&segment_id) {
-                return Ok(());
-            }
-        }
-
-        // Persisted first, like before, but the fsync now runs under
-        // the store lock only (store -> persisted lock order).
-        let mut store = store.lock().expect("store mutex poisoned");
-        store.append_translation(segment_id, &text, degraded)?;
-        drop(store);
-
-        Self::mutate_row(persisted, on_update, segment_id, |row| {
-            row.translation = Some(text);
-            row.degraded = degraded;
-            row.translation_error = None;
-        })
-    }
-
-    fn record_translation_error(
-        persisted: Arc<Mutex<Persisted>>,
-        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-        segment_id: u64,
-        message: String,
-    ) -> Result<(), PipelineError> {
-        Self::mutate_row(persisted, on_update, segment_id, |row| {
-            row.translation_error = Some(message);
-        })
-    }
-
-    // Shared shape of the per-row updates: lock, find by id (a row that
-    // left the live view is a no-op), mutate, then notify with a fresh
-    // snapshot outside the lock.
-    fn mutate_row(
-        persisted: Arc<Mutex<Persisted>>,
-        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-        segment_id: u64,
-        mutate: impl FnOnce(&mut Segment),
-    ) -> Result<(), PipelineError> {
-        let update = {
-            let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
-            let Some(&index) = persisted.row_index.get(&segment_id) else {
-                return Ok(());
-            };
-
-            mutate(&mut persisted.live_view[index]);
-            TranscriptUpdate::Replace {
-                index,
-                segment: persisted.live_view[index].clone(),
-            }
-        };
-
-        if let Some(callback) = on_update.lock().expect("on_update mutex poisoned").as_ref() {
-            callback(update);
-        }
-
-        Ok(())
+        self.scheduler.drain(&self.force_stop);
     }
 
     fn fire(&self, update: TranscriptUpdate) {
@@ -777,7 +579,7 @@ mod tests {
         }
     }
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn translation_context_uses_last_three_prior_translations() {
@@ -990,7 +792,7 @@ mod tests {
             Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
         )));
 
-        Pipeline::record_translation(
+        TranslationScheduler::record_translation(
             pipeline.persisted.clone(),
             pipeline.store.clone(),
             on_update.clone(),
@@ -1019,7 +821,7 @@ mod tests {
             Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
         )));
 
-        Pipeline::record_translation_error(
+        TranslationScheduler::record_translation_error(
             pipeline.persisted.clone(),
             on_update.clone(),
             123,
@@ -1138,7 +940,7 @@ mod tests {
             Box::new(folding_callback(snapshots.clone())) as TranscriptUpdateCallback,
         )));
 
-        let err = Pipeline::record_translation(
+        let err = TranslationScheduler::record_translation(
             pipeline.persisted.clone(),
             pipeline.store.clone(),
             on_update,
