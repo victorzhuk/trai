@@ -610,6 +610,22 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_whisper_kind_names_whisper_kind() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_kind = "something-else""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "whisper_kind: must be \"whisper.cpp\" or \"openai\""
+        );
+    }
+
+    #[test]
     fn stray_cloud_companion_without_openai_kind_is_rejected() {
         let toml = valid_toml().replace(
             r#"whisper_url = "http://localhost:8080""#,
@@ -623,6 +639,44 @@ mod tests {
             err.to_string(),
             "whisper_api_key: requires whisper_kind = \"openai\""
         );
+    }
+
+    #[test]
+    fn cloud_keys_under_local_dialect_are_rejected_naming_them() {
+        let cases: [(&str, &str); 4] = [
+            (
+                r#"whisper_api_key = "test-key""#,
+                r#"whisper_api_key: requires whisper_kind = "openai""#,
+            ),
+            (
+                r#"whisper_model = "whisper-large-v3-turbo""#,
+                r#"whisper_model: requires whisper_kind = "openai""#,
+            ),
+            (
+                r#"whisper_api_key = "test-key"
+            whisper_model = "whisper-large-v3-turbo""#,
+                r#"whisper_api_key: requires whisper_kind = "openai"; whisper_model too"#,
+            ),
+            (
+                r#"whisper_kind = "whisper.cpp"
+            whisper_api_key = "test-key""#,
+                r#"whisper_api_key: requires whisper_kind = "openai""#,
+            ),
+        ];
+
+        for (companions, expected) in cases {
+            let toml = valid_toml().replace(
+                r#"whisper_url = "http://localhost:8080""#,
+                &format!(
+                    r#"whisper_url = "http://localhost:8080"
+            {companions}"#
+                ),
+            );
+
+            let err = Config::from_toml_str(&toml).unwrap_err();
+
+            assert_eq!(err.to_string(), expected);
+        }
     }
 
     #[test]
