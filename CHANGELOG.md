@@ -13,9 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends finished segments to an OpenAI-compatible `/v1/audio/transcriptions`
   endpoint, configured with `whisper_api_key` and `whisper_model`. Local
   whisper.cpp remains the default.
-- **Geometric-mean confidence fallback.** When a transcription backend does
-  not report `avg_logprob`, confidence falls back to the geometric mean of
-  per-segment probabilities instead of an unknown value.
+- **avg_logprob confidence fallback.** When a transcription response
+  carries no per-word probabilities, confidence falls back to the segment's
+  `avg_logprob` instead of an unknown value.
 
 ## [0.1.1] - 2026-07-27
 

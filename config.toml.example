@@ -11,9 +11,10 @@ monitor_source = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
 # Stream's language instead of detecting it.
 # mic_language = "en"
 # monitor_language = "de"
-# Transcription backend kind. "server" (default) sends audio to a local
-# whisper.cpp server; "openai" speaks the OpenAI transcription API instead.
-# WARNING: with "openai" the meeting audio leaves this machine and is
+# Transcription backend kind: "whisper.cpp" (the default when this key
+# is absent) sends audio to a local whisper.cpp server; the only other
+# accepted value is "openai", which speaks the OpenAI transcription
+# API. WARNING: with "openai" the meeting audio leaves this machine and is
 # processed by the cloud provider — never point it at real calls unless
 # you accept that.
 # whisper_kind = "openai"
