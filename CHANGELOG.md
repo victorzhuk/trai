@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **OpenAI-compatible transcription backend.** `whisper_kind = "openai"`
+  sends finished segments to an OpenAI-compatible `/v1/audio/transcriptions`
+  endpoint, configured with `whisper_api_key` and `whisper_model`. Local
+  whisper.cpp remains the default.
+- **Geometric-mean confidence fallback.** When a transcription backend does
+  not report `avg_logprob`, confidence falls back to the geometric mean of
+  per-segment probabilities instead of an unknown value.
+
 ## [0.1.1] - 2026-07-27
 
 ### Fixed
