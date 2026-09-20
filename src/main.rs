@@ -391,18 +391,17 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 monitor_source,
             );
 
-            let transcriber: Arc<dyn Transcriber> =
-                match WhisperClient::new(
-                    &cfg_whisper_url,
-                    cfg_whisper_timeout,
-                    cfg_whisper_dialect.clone(),
-                ) {
-                    Ok(client) => Arc::new(client),
-                    Err(e) => {
-                        w.set_status_text(format!("start failed: {e}").into());
-                        return;
-                    }
-                };
+            let transcriber: Arc<dyn Transcriber> = match WhisperClient::new(
+                &cfg_whisper_url,
+                cfg_whisper_timeout,
+                cfg_whisper_dialect.clone(),
+            ) {
+                Ok(client) => Arc::new(client),
+                Err(e) => {
+                    w.set_status_text(format!("start failed: {e}").into());
+                    return;
+                }
+            };
             let translate_backends: Vec<Arc<dyn Translator>> = cfg_translate_backends
                 .iter()
                 .filter_map(|backend: &TranslateBackendConfig| {

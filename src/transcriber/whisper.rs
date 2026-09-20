@@ -78,8 +78,7 @@ impl Transcriber for WhisperClient {
         let request = match &self.dialect {
             Dialect::WhisperCpp => {
                 form = form.text("language", language_param(language).to_string());
-                self.client
-                    .post(format!("{}/inference", self.base_url))
+                self.client.post(format!("{}/inference", self.base_url))
             }
             Dialect::OpenAi { api_key, model } => {
                 // Omitted is not equivalent to `auto`: the cloud dialect
@@ -91,7 +90,7 @@ impl Transcriber for WhisperClient {
                 self.client
                     .post(format!("{}/audio/transcriptions", self.base_url))
                     .bearer_auth(api_key)
-                }
+            }
         };
         let began = Instant::now();
         let response = request
@@ -265,10 +264,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap();
                 assert!(n > 0, "client closed before sending headers");
                 request.extend_from_slice(&buf[..n]);
-                if let Some(pos) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                {
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                     break pos + 4;
                 }
             };
@@ -306,8 +302,7 @@ Connection: close\r\n\
     fn whisper_cpp_dialect_request_is_unchanged() {
         let (base_url, captured, server) =
             serve_capture("HTTP/1.1 200 OK", r#"{"text":" hello","segments":[]}"#);
-        let client =
-            WhisperClient::new(base_url, TEST_TIMEOUT, Dialect::WhisperCpp).unwrap();
+        let client = WhisperClient::new(base_url, TEST_TIMEOUT, Dialect::WhisperCpp).unwrap();
 
         let transcription = client.transcribe(&[0i16; 16], None).unwrap();
 
@@ -381,10 +376,8 @@ Connection: close\r\n\
 
     #[test]
     fn non_2xx_cloud_response_surfaces_status_and_preview_without_the_key() {
-        let (base_url, _captured, server) = serve_capture(
-            "HTTP/1.1 401 Unauthorized",
-            r#"{"error":"bad key"}"#,
-        );
+        let (base_url, _captured, server) =
+            serve_capture("HTTP/1.1 401 Unauthorized", r#"{"error":"bad key"}"#);
         let client = WhisperClient::new(
             base_url,
             TEST_TIMEOUT,
@@ -413,13 +406,12 @@ Connection: close\r\n\
     fn request_to_a_silent_server_times_out_instead_of_hanging() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let client =
-            WhisperClient::new(
-                format!("http://{address}"),
-                Duration::from_millis(250),
-                Dialect::WhisperCpp,
-            )
-            .unwrap();
+        let client = WhisperClient::new(
+            format!("http://{address}"),
+            Duration::from_millis(250),
+            Dialect::WhisperCpp,
+        )
+        .unwrap();
 
         let began = Instant::now();
         let err = client

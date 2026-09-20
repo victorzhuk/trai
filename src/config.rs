@@ -716,7 +716,10 @@ mod tests {
 
         let err = Config::from_toml_str(&toml).unwrap_err();
 
-        assert_eq!(err.to_string(), "missing required config key: whisper_model");
+        assert_eq!(
+            err.to_string(),
+            "missing required config key: whisper_model"
+        );
     }
 
     #[test]
