@@ -594,22 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_whisper_kind_names_whisper_kind() {
-        let toml = valid_toml().replace(
-            r#"whisper_url = "http://localhost:8080""#,
-            r#"whisper_url = "http://localhost:8080"
-            whisper_kind = "something-else""#,
-        );
-
-        let err = Config::from_toml_str(&toml).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "whisper_kind: must be \"whisper.cpp\" or \"openai\""
-        );
-    }
-
-    #[test]
     fn unrecognized_whisper_kind_names_whisper_kind() {
         let toml = valid_toml().replace(
             r#"whisper_url = "http://localhost:8080""#,
@@ -622,22 +606,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "whisper_kind: must be \"whisper.cpp\" or \"openai\""
-        );
-    }
-
-    #[test]
-    fn stray_cloud_companion_without_openai_kind_is_rejected() {
-        let toml = valid_toml().replace(
-            r#"whisper_url = "http://localhost:8080""#,
-            r#"whisper_url = "http://localhost:8080"
-            whisper_api_key = "test-key""#,
-        );
-
-        let err = Config::from_toml_str(&toml).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "whisper_api_key: requires whisper_kind = \"openai\""
         );
     }
 
@@ -677,23 +645,6 @@ mod tests {
 
             assert_eq!(err.to_string(), expected);
         }
-    }
-
-    #[test]
-    fn stray_cloud_companions_name_both_keys() {
-        let toml = valid_toml().replace(
-            r#"whisper_url = "http://localhost:8080""#,
-            r#"whisper_url = "http://localhost:8080"
-            whisper_api_key = "test-key"
-            whisper_model = "whisper-large-v3-turbo""#,
-        );
-
-        let err = Config::from_toml_str(&toml).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "whisper_api_key: requires whisper_kind = \"openai\"; whisper_model too"
-        );
     }
 
     #[test]
