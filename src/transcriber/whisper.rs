@@ -292,6 +292,28 @@ Connection: close\r\n\
     }
 
     #[test]
+    fn whisper_cpp_dialect_request_is_unchanged() {
+        let (base_url, captured, server) =
+            serve_capture("HTTP/1.1 200 OK", r#"{"text":" hello","segments":[]}"#);
+        let client =
+            WhisperClient::new(base_url, TEST_TIMEOUT, Dialect::WhisperCpp).unwrap();
+
+        let transcription = client.transcribe(&[0i16; 16], None).unwrap();
+
+        assert_eq!(transcription.text, " hello");
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(request.starts_with("POST /inference"));
+        // hyper lowercases header names on the wire; the value case is kept.
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        assert!(request.contains("name=\"language\"\r\n\r\nauto"));
+        assert!(request.contains("name=\"temperature\"\r\n\r\n0.0"));
+        assert!(request.contains("name=\"response_format\"\r\n\r\nverbose_json"));
+        assert!(request.contains("filename=\"segment.wav\""));
+        assert!(!request.contains("name=\"model\""));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn openai_dialect_posts_to_audio_transcriptions_with_bearer_and_model_and_no_language() {
         let (base_url, captured, server) =
             serve_capture("HTTP/1.1 200 OK", r#"{"text":" hello","segments":[]}"#);
