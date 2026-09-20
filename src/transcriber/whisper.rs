@@ -176,6 +176,8 @@ struct WhisperResponse {
 struct WhisperSegment {
     #[serde(default)]
     words: Vec<WhisperWord>,
+    #[serde(default)]
+    avg_logprob: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -194,10 +196,19 @@ fn parse_transcription(body: &str) -> Result<Transcription, TranscribeError> {
         .flat_map(|segment| segment.words.iter().map(|word| word.probability))
         .collect();
 
-    let mean_confidence = if probabilities.is_empty() {
-        0.0
-    } else {
+    let mean_confidence = if !probabilities.is_empty() {
         probabilities.iter().sum::<f32>() / probabilities.len() as f32
+    } else {
+        let logprobs: Vec<f32> = parsed
+            .segments
+            .iter()
+            .filter_map(|segment| segment.avg_logprob)
+            .collect();
+        if logprobs.is_empty() {
+            0.0
+        } else {
+            (logprobs.iter().sum::<f32>() / logprobs.len() as f32).exp()
+        }
     };
 
     Ok(Transcription {
@@ -452,6 +463,30 @@ Connection: close\r\n\
         let transcription = parse_transcription(body).unwrap();
         assert_eq!(transcription.text, " Hello world");
         assert!((transcription.mean_confidence - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn segments_with_only_avg_logprob_yield_geometric_mean_confidence() {
+        let body = r#"{
+            "text": " Hello world",
+            "segments": [
+                {"avg_logprob": -0.3},
+                {"avg_logprob": -0.5}
+            ]
+        }"#;
+
+        let transcription = parse_transcription(body).unwrap();
+        assert!((transcription.mean_confidence - 0.6703).abs() < 1e-3);
+        assert!(transcription.mean_confidence >= 0.6);
+    }
+
+    #[test]
+    fn hallucination_level_avg_logprob_lands_below_the_floor() {
+        let body = r#"{"text": " Hello", "segments": [{"avg_logprob": -0.8}]}"#;
+
+        let transcription = parse_transcription(body).unwrap();
+        assert!((transcription.mean_confidence - 0.4493).abs() < 1e-3);
+        assert!(transcription.mean_confidence < 0.6);
     }
 
     #[test]
