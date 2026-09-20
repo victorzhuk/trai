@@ -234,6 +234,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
     let cfg_monitor_source = config.monitor_source.clone();
     let cfg_for_params = config.clone();
     let cfg_whisper_url = config.whisper_url.clone();
+    let cfg_whisper_dialect = config.whisper_dialect.clone();
     let cfg_whisper_timeout = Duration::from_millis(config.whisper_timeout_ms);
     let cfg_translate_backends = config.translate.backends.clone();
     let cfg_translate_request_timeout = Duration::from_millis(config.translate.request_timeout_ms);
@@ -316,6 +317,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
         let cfg_store_root = cfg_store_root.clone();
         let cfg_for_params = cfg_for_params.clone();
         let cfg_whisper_url = cfg_whisper_url.clone();
+        let cfg_whisper_dialect = cfg_whisper_dialect.clone();
         let cfg_translate_backends = cfg_translate_backends.clone();
         let cfg_target_language = cfg_target_language.clone();
         window.on_begin_clicked(move || {
@@ -390,7 +392,11 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             );
 
             let transcriber: Arc<dyn Transcriber> =
-                match WhisperClient::new(&cfg_whisper_url, cfg_whisper_timeout) {
+                match WhisperClient::new(
+                    &cfg_whisper_url,
+                    cfg_whisper_timeout,
+                    cfg_whisper_dialect.clone(),
+                ) {
                     Ok(client) => Arc::new(client),
                     Err(e) => {
                         w.set_status_text(format!("start failed: {e}").into());

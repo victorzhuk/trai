@@ -36,17 +36,23 @@ impl fmt::Debug for Dialect {
 
 pub struct WhisperClient {
     base_url: String,
+    dialect: Dialect,
     client: reqwest::blocking::Client,
 }
 
 impl WhisperClient {
-    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, TranscribeError> {
+    pub fn new(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        dialect: Dialect,
+    ) -> Result<Self, TranscribeError> {
         let client = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|e| TranscribeError::new(format!("failed to build whisper client: {e}")))?;
         Ok(Self {
             base_url: base_url.into(),
+            dialect,
             client,
         })
     }
@@ -64,17 +70,31 @@ impl Transcriber for WhisperClient {
             .mime_str("audio/wav")
             .map_err(|e| TranscribeError::new(format!("failed to build multipart part: {e}")))?;
 
-        let form = reqwest::blocking::multipart::Form::new()
+        let mut form = reqwest::blocking::multipart::Form::new()
             .part("file", part)
             .text("response_format", "verbose_json")
-            .text("temperature", "0.0")
-            .text("language", language_param(language).to_string());
+            .text("temperature", "0.0");
 
-        let url = format!("{}/inference", self.base_url);
+        let request = match &self.dialect {
+            Dialect::WhisperCpp => {
+                form = form.text("language", language_param(language).to_string());
+                self.client
+                    .post(format!("{}/inference", self.base_url))
+            }
+            Dialect::OpenAi { api_key, model } => {
+                // Omitted is not equivalent to `auto`: the cloud dialect
+                // detects the language itself when the field is absent.
+                if let Some(language) = language.map(str::trim).filter(|l| !l.is_empty()) {
+                    form = form.text("language", language.to_string());
+                }
+                form = form.text("model", model.clone());
+                self.client
+                    .post(format!("{}/audio/transcriptions", self.base_url))
+                    .bearer_auth(api_key)
+                }
+        };
         let began = Instant::now();
-        let response = self
-            .client
-            .post(&url)
+        let response = request
             .multipart(form)
             .send()
             .map_err(|e| TranscribeError::new(format!("whisper request failed: {e}")))?;
@@ -206,14 +226,137 @@ fn detected_language(parsed: &WhisperResponse) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// One-shot HTTP double: captures the raw request (headers plus
+    /// Content-Length body) and replies with the given status and body.
+    fn serve_capture(
+        status_line: &str,
+        response_body: &str,
+    ) -> (String, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let status_line = status_line.to_string();
+        let response_body = response_body.to_string();
+
+        let captured_clone = captured.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending headers");
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    break pos + 4;
+                }
+            };
+            let content_length: usize = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending the body");
+                request.extend_from_slice(&buf[..n]);
+            }
+            *captured_clone.lock().unwrap() = request;
+
+            let response = format!(
+                "{status_line}\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        (format!("http://{address}"), captured, server)
+    }
+
+    #[test]
+    fn openai_dialect_posts_to_audio_transcriptions_with_bearer_and_model_and_no_language() {
+        let (base_url, captured, server) =
+            serve_capture("HTTP/1.1 200 OK", r#"{"text":" hello","segments":[]}"#);
+        let client = WhisperClient::new(
+            base_url,
+            TEST_TIMEOUT,
+            Dialect::OpenAi {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            },
+        )
+        .unwrap();
+
+        let transcription = client.transcribe(&[0i16; 16], None).unwrap();
+
+        assert_eq!(transcription.text, " hello");
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(request.starts_with("POST /audio/transcriptions"));
+        // hyper lowercases header names on the wire; the value case is kept.
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-key"));
+        assert!(request.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo"));
+        assert!(request.contains("name=\"response_format\"\r\n\r\nverbose_json"));
+        assert!(request.contains("name=\"temperature\"\r\n\r\n0.0"));
+        assert!(!request.contains("name=\"language\""));
+        // All-zero samples keep the WAV bytes deterministic, so the
+        // absence of `auto` anywhere in the request is a sound check.
+        assert!(!request.contains("auto"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn openai_dialect_with_configured_language_sends_it_and_never_auto() {
+        let (base_url, captured, server) =
+            serve_capture("HTTP/1.1 200 OK", r#"{"text":" hallo","segments":[]}"#);
+        let client = WhisperClient::new(
+            base_url,
+            TEST_TIMEOUT,
+            Dialect::OpenAi {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            },
+        )
+        .unwrap();
+
+        client.transcribe(&[0i16; 16], Some(" de ")).unwrap();
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(request.contains("name=\"language\"\r\n\r\nde"));
+        assert!(!request.contains("auto"));
+        server.join().unwrap();
+    }
 
     #[test]
     fn request_to_a_silent_server_times_out_instead_of_hanging() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client =
-            WhisperClient::new(format!("http://{address}"), Duration::from_millis(250)).unwrap();
+            WhisperClient::new(
+                format!("http://{address}"),
+                Duration::from_millis(250),
+                Dialect::WhisperCpp,
+            )
+            .unwrap();
 
         let began = Instant::now();
         let err = client
