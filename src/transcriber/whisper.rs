@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -11,6 +12,27 @@ use crate::segmenter::SAMPLE_RATE_HZ;
 /// Omitting the field is not equivalent: whisper's own default is `en`,
 /// so an omitted field decodes English rather than detecting.
 const DETECT: &str = "auto";
+
+/// Which transcription backend the configured `whisper_url` speaks.
+#[derive(Clone, PartialEq)]
+pub enum Dialect {
+    WhisperCpp,
+    OpenAi { api_key: String, model: String },
+}
+
+// Manual Debug so the bearer key never lands in logs via {:?}.
+impl fmt::Debug for Dialect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WhisperCpp => f.debug_struct("WhisperCpp").finish(),
+            Self::OpenAi { api_key: _, model } => f
+                .debug_struct("OpenAi")
+                .field("api_key", &Some::<&str>("<redacted>"))
+                .field("model", model)
+                .finish(),
+        }
+    }
+}
 
 pub struct WhisperClient {
     base_url: String,

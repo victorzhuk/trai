@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::transcriber::Dialect;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub store_root: PathBuf,
@@ -11,6 +13,7 @@ pub struct Config {
     pub mic_language: Option<String>,
     pub monitor_language: Option<String>,
     pub whisper_url: String,
+    pub whisper_dialect: Dialect,
     pub whisper_timeout_ms: u64,
     pub target_language: String,
     pub translate: TranslateConfig,
@@ -117,6 +120,9 @@ struct RawConfig {
     mic_language: Option<String>,
     monitor_language: Option<String>,
     whisper_url: Option<String>,
+    whisper_kind: Option<String>,
+    whisper_api_key: Option<String>,
+    whisper_model: Option<String>,
     whisper_timeout_ms: Option<u64>,
     target_language: Option<String>,
     translate: Option<RawTranslateConfig>,
@@ -280,6 +286,53 @@ impl Config {
         if !(0.0..=1.0).contains(&confidence_floor) {
             return Err(invalid("confidence_floor", "must be within [0.0, 1.0]"));
         }
+
+        let whisper_dialect = match raw.whisper_kind.as_deref() {
+            None | Some("whisper.cpp") => {
+                // Blank counts as absent, matching the translate backend.
+                let api_key = raw.whisper_api_key.filter(|key| !key.trim().is_empty());
+                let model = raw.whisper_model.filter(|model| !model.trim().is_empty());
+                match (api_key, model) {
+                    (Some(_), Some(_)) => {
+                        return Err(invalid(
+                            "whisper_api_key",
+                            "requires whisper_kind = \"openai\"; whisper_model too",
+                        ));
+                    }
+                    (Some(_), None) => {
+                        return Err(invalid(
+                            "whisper_api_key",
+                            "requires whisper_kind = \"openai\"",
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(invalid(
+                            "whisper_model",
+                            "requires whisper_kind = \"openai\"",
+                        ));
+                    }
+                    (None, None) => Dialect::WhisperCpp,
+                }
+            }
+            Some("openai") => {
+                let api_key = raw
+                    .whisper_api_key
+                    .filter(|key| !key.trim().is_empty())
+                    .ok_or(ConfigError::Missing("whisper_api_key"))?;
+                let model = raw
+                    .whisper_model
+                    .filter(|model| !model.trim().is_empty())
+                    .ok_or(ConfigError::Missing("whisper_model"))?;
+                Dialect::OpenAi { api_key, model }
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "whisper_kind",
+                    "must be \"whisper.cpp\" or \"openai\"",
+                ));
+            }
+        };
+
         if !(0.0..=1.0).contains(&vad_threshold) {
             return Err(invalid("vad_threshold", "must be within [0.0, 1.0]"));
         }
@@ -300,6 +353,7 @@ impl Config {
             mic_language: raw.mic_language,
             monitor_language: raw.monitor_language,
             whisper_url,
+            whisper_dialect,
             whisper_timeout_ms,
             target_language,
             translate,
@@ -444,6 +498,165 @@ mod tests {
         assert_eq!(config.mic_language, None);
         assert_eq!(config.monitor_language, None);
         assert_eq!(config.translate.backends[0].api_key, None);
+    }
+
+    #[test]
+    fn whisper_kind_absent_defaults_to_whisper_cpp_dialect() {
+        let config = Config::from_toml_str(&valid_toml()).unwrap();
+
+        assert_eq!(config.whisper_dialect, Dialect::WhisperCpp);
+    }
+
+    #[test]
+    fn whisper_kind_whisper_cpp_parses_as_whisper_cpp_dialect() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_kind = "whisper.cpp""#,
+        );
+
+        let config = Config::from_toml_str(&toml).unwrap();
+
+        assert_eq!(config.whisper_dialect, Dialect::WhisperCpp);
+    }
+
+    #[test]
+    fn openai_dialect_round_trips_key_and_model() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_api_key = "test-key"
+            whisper_model = "whisper-large-v3-turbo""#,
+        );
+
+        let config = Config::from_toml_str(&toml).unwrap();
+
+        assert_eq!(
+            config.whisper_dialect,
+            Dialect::OpenAi {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn openai_without_api_key_names_exactly_whisper_api_key() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_model = "whisper-large-v3-turbo""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "missing required config key: whisper_api_key"
+        );
+    }
+
+    #[test]
+    fn openai_blank_api_key_counts_as_absent() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_api_key = "   "
+            whisper_model = "whisper-large-v3-turbo""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "missing required config key: whisper_api_key"
+        );
+    }
+
+    #[test]
+    fn openai_without_model_names_exactly_whisper_model() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_api_key = "test-key""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "missing required config key: whisper_model"
+        );
+    }
+
+    #[test]
+    fn unknown_whisper_kind_names_whisper_kind() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_kind = "something-else""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "whisper_kind: must be \"whisper.cpp\" or \"openai\""
+        );
+    }
+
+    #[test]
+    fn stray_cloud_companion_without_openai_kind_is_rejected() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_api_key = "test-key""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "whisper_api_key: requires whisper_kind = \"openai\""
+        );
+    }
+
+    #[test]
+    fn stray_cloud_companions_name_both_keys() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_api_key = "test-key"
+            whisper_model = "whisper-large-v3-turbo""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "whisper_api_key: requires whisper_kind = \"openai\"; whisper_model too"
+        );
+    }
+
+    #[test]
+    fn openai_dialect_debug_output_redacts_the_api_key() {
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_api_key = "super-secret-key"
+            whisper_model = "whisper-large-v3-turbo""#,
+        );
+
+        let config = Config::from_toml_str(&toml).unwrap();
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("super-secret-key"), "key leaked: {debug}");
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

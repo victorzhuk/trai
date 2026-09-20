@@ -7,7 +7,7 @@ pub mod whisper;
 
 #[cfg(any(test, feature = "test-doubles"))]
 pub use fake::FakeTranscriber;
-pub use whisper::WhisperClient;
+pub use whisper::{Dialect, WhisperClient};
 
 use std::fmt;
 
