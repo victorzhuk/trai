@@ -697,6 +697,29 @@ mod tests {
     }
 
     #[test]
+    fn blank_companions_are_treated_as_absent() {
+        let blank_key = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "http://localhost:8080"
+            whisper_api_key = "   ""#,
+        );
+        let config = Config::from_toml_str(&blank_key).unwrap();
+        assert_eq!(config.whisper_dialect, Dialect::WhisperCpp);
+
+        let toml = valid_toml().replace(
+            r#"whisper_url = "http://localhost:8080""#,
+            r#"whisper_url = "https://api.openai.com"
+            whisper_kind = "openai"
+            whisper_api_key = "test-key"
+            whisper_model = "   ""#,
+        );
+
+        let err = Config::from_toml_str(&toml).unwrap_err();
+
+        assert_eq!(err.to_string(), "missing required config key: whisper_model");
+    }
+
+    #[test]
     fn openai_dialect_debug_output_redacts_the_api_key() {
         let toml = valid_toml().replace(
             r#"whisper_url = "http://localhost:8080""#,
