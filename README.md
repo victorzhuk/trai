@@ -31,7 +31,13 @@ language, and writes everything to disk as the meeting runs.
 
 - Linux with PipeWire
 - A Whisper server (e.g., [whisper.cpp server](https://github.com/ggerganov/whisper.cpp))
-  reachable at a configured URL
+  reachable at a configured URL. Alternatively, any OpenAI-compatible
+  transcription endpoint works by setting `whisper_kind = "openai"` — e.g.
+  [Groq](https://console.groq.com) with `whisper_url =
+  "https://api.groq.com/openai/v1"`, `whisper_model =
+  "whisper-large-v3-turbo"`, and your `whisper_api_key`. **Privacy warning:**
+  unlike a local server, the cloud endpoint sends your meeting audio
+  off-machine.
 - One or more OpenAI-compatible translation endpoints (e.g., LM Studio,
   Ollama, or any `/v1/chat/completions` server)
 - Rust 1.70+ (for building from source)
@@ -46,8 +52,8 @@ make build
 
 # Create your config from the template
 make config
-# Edit config.toml: set store_root, sources, whisper_url, whisper_timeout_ms,
-# target_language, and your translation backends
+# Edit config.toml: set store_root, sources, whisper_kind, whisper_url,
+# whisper_timeout_ms, target_language, and your translation backends
 
 # Run
 make run
