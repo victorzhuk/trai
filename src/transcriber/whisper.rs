@@ -466,6 +466,25 @@ Connection: close\r\n\
     }
 
     #[test]
+    fn words_take_precedence_over_avg_logprob() {
+        let body = r#"{
+            "text": " Hello world",
+            "segments": [
+                {
+                    "words": [
+                        {"word": " Hello", "probability": 0.9},
+                        {"word": " world", "probability": 0.8}
+                    ]
+                },
+                {"avg_logprob": -0.8}
+            ]
+        }"#;
+
+        let transcription = parse_transcription(body).unwrap();
+        assert!((transcription.mean_confidence - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
     fn segments_with_only_avg_logprob_yield_geometric_mean_confidence() {
         let body = r#"{
             "text": " Hello world",
