@@ -369,6 +369,36 @@ Connection: close\r\n\
     }
 
     #[test]
+    fn non_2xx_cloud_response_surfaces_status_and_preview_without_the_key() {
+        let (base_url, _captured, server) = serve_capture(
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bad key"}"#,
+        );
+        let client = WhisperClient::new(
+            base_url,
+            TEST_TIMEOUT,
+            Dialect::OpenAi {
+                api_key: "test-key".to_string(),
+                model: "whisper-large-v3-turbo".to_string(),
+            },
+        )
+        .unwrap();
+
+        let err = client
+            .transcribe(&[0i16; 16], None)
+            .expect_err("a 401 must fail the request");
+
+        let message = err.to_string();
+        assert!(message.contains("whisper returned 401"));
+        assert!(message.contains("bad key"));
+        assert!(!message.contains("test-key"));
+        // Headers, the only place the key travels, never reach the body
+        // preview; checking the Debug form too guards future refactors.
+        assert!(!format!("{err:?}").contains("test-key"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn request_to_a_silent_server_times_out_instead_of_hanging() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
