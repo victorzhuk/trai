@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,23 +48,71 @@ impl TranslationScheduler {
         persisted: Arc<Mutex<Persisted>>,
         store: Arc<Mutex<dyn SegmentSink>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+        fire_lock: Arc<Mutex<()>>,
         target_language: String,
     ) -> Self {
-        let (tx, rx) = channel();
+        let (tx, rx) = channel::<TranslationJob>();
         let in_flight = Arc::new((Mutex::new(0usize), Condvar::new()));
 
         thread::spawn({
             let in_flight = in_flight.clone();
             move || {
-                Self::worker(
-                    rx,
-                    translator,
-                    persisted,
-                    store,
-                    on_update,
-                    target_language,
-                    in_flight,
-                );
+                while let Ok(job) = rx.recv() {
+                    // Decrements the counter and wakes drain even if the job
+                    // panics mid-flight.
+                    let _settled = TranslationSettled(&in_flight);
+
+                    let context = {
+                        let persisted = persisted.lock().expect("pipeline mutex poisoned");
+                        persisted.translation_context(job.segment_id, &target_language)
+                    };
+
+                    let began = Instant::now();
+                    match translator.translate(&job.text, &context) {
+                        Ok(translation) => {
+                            crate::debug!(
+                                "translate: segment {} ok in {:.2}s{} \"{}\"",
+                                job.segment_id,
+                                began.elapsed().as_secs_f64(),
+                                if translation.degraded {
+                                    " (degraded)"
+                                } else {
+                                    ""
+                                },
+                                crate::log::preview(&translation.text, 60),
+                            );
+                            if let Err(e) = Self::record_translation(
+                                persisted.clone(),
+                                store.clone(),
+                                on_update.clone(),
+                                fire_lock.clone(),
+                                job.segment_id,
+                                translation.text,
+                                translation.degraded,
+                            ) {
+                                crate::debug!("translation persist failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            crate::debug!(
+                                "translate: segment {} failed after {:.2}s: {e}",
+                                job.segment_id,
+                                began.elapsed().as_secs_f64()
+                            );
+                            if e.is_misconfigured() {
+                                if let Err(store_err) = Self::record_translation_error(
+                                    persisted.clone(),
+                                    on_update.clone(),
+                                    fire_lock.clone(),
+                                    job.segment_id,
+                                    e.to_string(),
+                                ) {
+                                    crate::debug!("translation error persist failed: {store_err}");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -107,75 +155,11 @@ impl TranslationScheduler {
         }
     }
 
-    fn worker(
-        rx: Receiver<TranslationJob>,
-        translator: Arc<dyn Translator>,
-        persisted: Arc<Mutex<Persisted>>,
-        store: Arc<Mutex<dyn SegmentSink>>,
-        on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
-        target_language: String,
-        in_flight: Arc<(Mutex<usize>, Condvar)>,
-    ) {
-        while let Ok(job) = rx.recv() {
-            // Decrements the counter and wakes drain even if the job
-            // panics mid-flight.
-            let _settled = TranslationSettled(&in_flight);
-
-            let context = {
-                let persisted = persisted.lock().expect("pipeline mutex poisoned");
-                persisted.translation_context(job.segment_id, &target_language)
-            };
-
-            let began = Instant::now();
-            match translator.translate(&job.text, &context) {
-                Ok(translation) => {
-                    crate::debug!(
-                        "translate: segment {} ok in {:.2}s{} \"{}\"",
-                        job.segment_id,
-                        began.elapsed().as_secs_f64(),
-                        if translation.degraded {
-                            " (degraded)"
-                        } else {
-                            ""
-                        },
-                        crate::log::preview(&translation.text, 60),
-                    );
-                    if let Err(e) = Self::record_translation(
-                        persisted.clone(),
-                        store.clone(),
-                        on_update.clone(),
-                        job.segment_id,
-                        translation.text,
-                        translation.degraded,
-                    ) {
-                        crate::debug!("translation persist failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    crate::debug!(
-                        "translate: segment {} failed after {:.2}s: {e}",
-                        job.segment_id,
-                        began.elapsed().as_secs_f64()
-                    );
-                    if e.is_misconfigured() {
-                        if let Err(store_err) = Self::record_translation_error(
-                            persisted.clone(),
-                            on_update.clone(),
-                            job.segment_id,
-                            e.to_string(),
-                        ) {
-                            crate::debug!("translation error persist failed: {store_err}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) fn record_translation(
         persisted: Arc<Mutex<Persisted>>,
         store: Arc<Mutex<dyn SegmentSink>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+        fire_lock: Arc<Mutex<()>>,
         segment_id: u64,
         text: String,
         degraded: bool,
@@ -193,7 +177,7 @@ impl TranslationScheduler {
         store.append_translation(segment_id, &text, degraded)?;
         drop(store);
 
-        Self::mutate_row(persisted, on_update, segment_id, |row| {
+        Self::mutate_row(fire_lock, persisted, on_update, segment_id, |row| {
             row.translation = Some(text);
             row.degraded = degraded;
             row.translation_error = None;
@@ -203,23 +187,29 @@ impl TranslationScheduler {
     pub(crate) fn record_translation_error(
         persisted: Arc<Mutex<Persisted>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
+        fire_lock: Arc<Mutex<()>>,
         segment_id: u64,
         message: String,
     ) -> Result<(), PipelineError> {
-        Self::mutate_row(persisted, on_update, segment_id, |row| {
+        Self::mutate_row(fire_lock, persisted, on_update, segment_id, |row| {
             row.translation_error = Some(message);
         })
     }
 
     // Shared shape of the per-row updates: lock, find by id (a row that
     // left the live view is a no-op), mutate, then notify with the
-    // changed row outside the lock.
+    // changed row outside the lock. The whole mutate+notify pair runs
+    // under `fire_lock` so the index in the update can't be shifted by
+    // a concurrent insert/remove before the callback sees it; the
+    // callback itself still runs off `persisted`.
     fn mutate_row(
+        fire_lock: Arc<Mutex<()>>,
         persisted: Arc<Mutex<Persisted>>,
         on_update: Arc<Mutex<Option<TranscriptUpdateCallback>>>,
         segment_id: u64,
         mutate: impl FnOnce(&mut Segment),
     ) -> Result<(), PipelineError> {
+        let _ordered = fire_lock.lock().expect("fire mutex poisoned");
         let update = {
             let mut persisted = persisted.lock().expect("pipeline mutex poisoned");
             let Some((index, segment)) = persisted.mutate_row(segment_id, mutate) else {

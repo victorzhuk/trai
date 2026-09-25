@@ -51,7 +51,7 @@ impl WhisperClient {
             .build()
             .map_err(|e| TranscribeError::new(format!("failed to build whisper client: {e}")))?;
         Ok(Self {
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             dialect,
             client,
         })
@@ -372,6 +372,36 @@ Connection: close\r\n\
         assert!(request.contains("name=\"language\"\r\n\r\nde"));
         assert!(!request.contains("auto"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn trailing_slash_in_base_url_does_not_double_the_path_separator() {
+        for (expected_path, dialect) in [
+            ("/inference", Dialect::WhisperCpp),
+            (
+                "/audio/transcriptions",
+                Dialect::OpenAi {
+                    api_key: "test-key".to_string(),
+                    model: "whisper-large-v3-turbo".to_string(),
+                },
+            ),
+        ] {
+            let (base_url, captured, server) =
+                serve_capture("HTTP/1.1 200 OK", r#"{"text":" hi","segments":[]}"#);
+            let base_url = format!("{base_url}/");
+            let client = WhisperClient::new(base_url, TEST_TIMEOUT, dialect).unwrap();
+
+            client.transcribe(&[0i16; 16], None).unwrap();
+
+            let request = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+            assert!(
+                request.starts_with(&format!("POST {expected_path} ")),
+                "expected {expected_path}, got: {}",
+                &request[..40.min(request.len())]
+            );
+            assert!(!request.contains("//"));
+            server.join().unwrap();
+        }
     }
 
     #[test]

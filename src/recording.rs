@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Condvar, Mutex};
@@ -77,17 +77,114 @@ struct RecordingMeta {
 }
 
 // Transcripts hold meeting content: owner-only from creation.
+// Writes to a uniquely named temp file in the same directory (so the
+// rename is atomic), fsyncs the file, renames over the destination,
+// then fsyncs the directory so the rename survives a crash. The temp
+// file is removed on any error path.
 fn write_meta(path: &Path, meta: &RecordingMeta) -> io::Result<()> {
     let json = serde_json::to_string_pretty(meta).map_err(io::Error::other)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("open {}: {e}", path.display())))?;
-    file.write_all(json.as_bytes())
-        .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", path.display())))
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    // pid + nanos keeps concurrent processes and back-to-back writes
+    // in the same process from picking the same temp name.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 | (d.as_secs() << 32))
+        .unwrap_or(0);
+    let mut tmp = None;
+    for attempt in 0..4 {
+        let candidate = dir.join(format!(
+            ".{}.tmp.{}.{:x}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("meta"),
+            std::process::id(),
+            nanos + attempt,
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                tmp = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("create {}: {e}", candidate.display()),
+                ))
+            }
+        }
+    }
+    let Some((tmp_path, mut file)) = tmp else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("temp file for {} keeps colliding", path.display()),
+        ));
+    };
+
+    let result = (|| -> io::Result<()> {
+        file.write_all(json.as_bytes())
+            .map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", tmp_path.display())))?;
+        file.sync_all()
+            .map_err(|e| io::Error::new(e.kind(), format!("sync {}: {e}", tmp_path.display())))?;
+        fs::rename(&tmp_path, path)
+            .map_err(|e| io::Error::new(e.kind(), format!("rename to {}: {e}", path.display())))?;
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+// Durability of a rename or directory create is only guaranteed once
+// the parent directory itself is fsynced.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Picks a recording directory under `root` that no other process can
+/// simultaneously claim: each candidate is created with an exclusive
+/// `mkdir`, so the first writer of a name wins atomically and losers
+/// fall back to the next candidate. `root` is created if missing.
+pub fn reserve_store_dir(root: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)
+        .map_err(|e| io::Error::new(e.kind(), format!("create root '{}': {e}", root.display())))?;
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for attempt in 0..1000u64 {
+        let candidate = if attempt == 0 {
+            root.join(secs.to_string())
+        } else {
+            root.join(format!("{secs}-{attempt}"))
+        };
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&candidate).map_err(|e| {
+            io::Error::new(e.kind(), format!("reserve '{}': {e}", candidate.display()))
+        }) {
+            Ok(()) => {
+                if let Err(e) = sync_dir(root) {
+                    // The candidate exists only because we made it;
+                    // a failed fsync must not leave it reserved.
+                    let _ = fs::remove_dir(&candidate);
+                    return Err(e);
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free recording dir under '{}'", root.display()),
+    ))
 }
 
 // Segment submissions block on the transcription backend, so a small
@@ -153,6 +250,25 @@ impl SubmissionQueue {
     }
 }
 
+// Kill and reap one child. A refused SIGKILL must not hang stop() on a
+// child that stays alive: reap it only if it already exited, else
+// surface the kill error.
+fn stop_child(child: &mut Child, name: &str) -> io::Result<()> {
+    if let Err(e) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(io::Error::other(format!("kill {name} pw-record: {e}"))),
+            Err(wait_err) => Err(io::Error::other(format!(
+                "kill {name} pw-record: {e}; reap: {wait_err}"
+            ))),
+        };
+    }
+    child
+        .wait()
+        .map_err(|e| io::Error::other(format!("wait {name} pw-record: {e}")))?;
+    Ok(())
+}
+
 /// Owns the two pw-record child processes feeding a Recording, so the
 /// capture lifecycle (spawn both, kill both) lives at the process edge
 /// and the library core works with plain readers.
@@ -207,9 +323,9 @@ impl Capture {
     }
 
     fn stop(&mut self) -> io::Result<()> {
-        pw_record::stop(&mut self.mic_child)?;
-        pw_record::stop(&mut self.monitor_child)?;
-        Ok(())
+        let mic_result = stop_child(&mut self.mic_child, "mic");
+        let monitor_result = stop_child(&mut self.monitor_child, "monitor");
+        mic_result.and(monitor_result)
     }
 
     fn stop_quiet(&mut self) {
@@ -286,14 +402,52 @@ impl Recording {
         R1: io::Read + Send + 'static,
         R2: io::Read + Send + 'static,
     {
-        fs::create_dir_all(&params.store_dir).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("create store dir '{}': {e}", params.store_dir.display()),
-            )
-        })?;
+        // Exclusive mkdir: AlreadyExists is expected when the caller
+        // reserved the dir via reserve_store_dir; only a true
+        // filesystem failure is an error.
+        let dir_fresh = match fs::DirBuilder::new().mode(0o700).create(&params.store_dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("create store dir '{}': {e}", params.store_dir.display()),
+                ))
+            }
+        };
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&params.store_dir, fs::Permissions::from_mode(0o700))?;
+
+        // create_new so a dir shared by two processes errors before
+        // the loser truncates the winner's files.
+        let rollback_store_dir = params.store_dir.clone();
+        let rollback = |created: &[std::path::PathBuf]| {
+            for path in created {
+                let _ = fs::remove_file(path);
+            }
+            // Only a dir this call created is torn down, and only once
+            // empty: anything left in it belongs to someone else.
+            if dir_fresh && fs::read_dir(&rollback_store_dir).is_ok_and(|d| d.count() == 0) {
+                let _ = fs::remove_dir(&rollback_store_dir);
+            }
+        };
+        let mut created = Vec::new();
+        for name in ["meta.json", "mic.wav", "monitor.wav"] {
+            let path = params.store_dir.join(name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => created.push(path),
+                Err(e) => {
+                    rollback(&created);
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "recording dir '{}' already in use: {e}",
+                            params.store_dir.display()
+                        ),
+                    ));
+                }
+            }
+        }
 
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -312,94 +466,106 @@ impl Recording {
             duration_secs: None,
             segment_count: None,
         };
-        write_meta(&params.store_dir.join("meta.json"), &meta)?;
+        let started = (|| -> io::Result<Self> {
+            write_meta(&params.store_dir.join("meta.json"), &meta)?;
 
-        let store = Store::open(&params.store_dir.join("segments.jsonl"))?;
-        let pipeline = Arc::new(Pipeline::new(
-            transcriber,
-            translator,
-            store,
-            params.confidence_floor,
-            params.target_language.clone(),
-        ));
-        // Register the live-view callback before either reader thread
-        // is spawned: a segment can arrive the instant a reader
-        // starts, so the callback must already be in place or early
-        // rows would silently never reach the UI.
-        pipeline.set_on_update(on_transcript_update);
+            let segments_path = params.store_dir.join("segments.jsonl");
+            let store = Store::open(&segments_path)?;
+            created.push(segments_path);
+            let pipeline = Arc::new(Pipeline::new(
+                transcriber,
+                translator,
+                store,
+                params.confidence_floor,
+                params.target_language.clone(),
+            ));
+            // Register the live-view callback before either reader thread
+            // is spawned: a segment can arrive the instant a reader
+            // starts, so the callback must already be in place or early
+            // rows would silently never reach the UI.
+            pipeline.set_on_update(on_transcript_update);
 
-        let mic_wav = WavWriter::create(&params.store_dir.join("mic.wav"))
-            .map_err(|e| io::Error::new(e.kind(), format!("create mic.wav: {e}")))?;
-        let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))
-            .map_err(|e| io::Error::new(e.kind(), format!("create monitor.wav: {e}")))?;
+            let mic_wav = WavWriter::create(&params.store_dir.join("mic.wav"))
+                .map_err(|e| io::Error::new(e.kind(), format!("create mic.wav: {e}")))?;
+            let monitor_wav = WavWriter::create(&params.store_dir.join("monitor.wav"))
+                .map_err(|e| io::Error::new(e.kind(), format!("create monitor.wav: {e}")))?;
 
-        let submissions = Arc::new(SubmissionQueue {
-            inner: Mutex::new(SubmissionQueueInner::default()),
-            cvar: Condvar::new(),
-        });
-        let submission_workers = (0..SUBMISSION_WORKERS)
-            .map(|_| {
+            let submissions = Arc::new(SubmissionQueue {
+                inner: Mutex::new(SubmissionQueueInner::default()),
+                cvar: Condvar::new(),
+            });
+            let submission_workers = (0..SUBMISSION_WORKERS)
+                .map(|_| {
+                    let pipeline = pipeline.clone();
+                    let submissions = submissions.clone();
+                    thread::spawn(move || {
+                        while let Some(input) = submissions.pop() {
+                            if let Err(e) = pipeline.finish_pending(input) {
+                                crate::debug!("segment submission failed: {e}");
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let mic_reader = {
                 let pipeline = pipeline.clone();
                 let submissions = submissions.clone();
+                let reader_params = ReaderParams {
+                    speaker_tag: SpeakerTag::Me,
+                    language: params.mic_language.clone(),
+                    vad_threshold: params.vad_threshold,
+                    silence_hold_ms: params.silence_hold_ms,
+                    duration_cap_ms: params.duration_cap_ms,
+                    live_chunk_ms: params.live_chunk_ms,
+                };
                 thread::spawn(move || {
-                    while let Some(input) = submissions.pop() {
-                        if let Err(e) = pipeline.finish_pending(input) {
-                            crate::debug!("segment submission failed: {e}");
-                        }
-                    }
+                    run_reader(mic_source, mic_wav, reader_params, pipeline, submissions)
                 })
-            })
-            .collect();
-
-        let mic_reader = {
-            let pipeline = pipeline.clone();
-            let submissions = submissions.clone();
-            let reader_params = ReaderParams {
-                speaker_tag: SpeakerTag::Me,
-                language: params.mic_language.clone(),
-                vad_threshold: params.vad_threshold,
-                silence_hold_ms: params.silence_hold_ms,
-                duration_cap_ms: params.duration_cap_ms,
-                live_chunk_ms: params.live_chunk_ms,
             };
-            thread::spawn(move || {
-                run_reader(mic_source, mic_wav, reader_params, pipeline, submissions)
-            })
-        };
 
-        let monitor_reader = {
-            let pipeline = pipeline.clone();
-            let submissions = submissions.clone();
-            let reader_params = ReaderParams {
-                speaker_tag: SpeakerTag::Them,
-                language: params.monitor_language.clone(),
-                vad_threshold: params.vad_threshold,
-                silence_hold_ms: params.silence_hold_ms,
-                duration_cap_ms: params.duration_cap_ms,
-                live_chunk_ms: params.live_chunk_ms,
+            let monitor_reader = {
+                let pipeline = pipeline.clone();
+                let submissions = submissions.clone();
+                let reader_params = ReaderParams {
+                    speaker_tag: SpeakerTag::Them,
+                    language: params.monitor_language.clone(),
+                    vad_threshold: params.vad_threshold,
+                    silence_hold_ms: params.silence_hold_ms,
+                    duration_cap_ms: params.duration_cap_ms,
+                    live_chunk_ms: params.live_chunk_ms,
+                };
+                thread::spawn(move || {
+                    run_reader(
+                        monitor_source,
+                        monitor_wav,
+                        reader_params,
+                        pipeline,
+                        submissions,
+                    )
+                })
             };
-            thread::spawn(move || {
-                run_reader(
-                    monitor_source,
-                    monitor_wav,
-                    reader_params,
-                    pipeline,
-                    submissions,
-                )
-            })
-        };
 
-        Ok(Self {
-            capture: None,
-            mic_reader,
-            monitor_reader,
-            submissions,
-            submission_workers,
-            pipeline,
-            store_dir: params.store_dir,
-            start,
-            meta,
-        })
+            Ok(Self {
+                capture: None,
+                mic_reader,
+                monitor_reader,
+                submissions,
+                submission_workers,
+                pipeline,
+                store_dir: params.store_dir,
+                start,
+                meta,
+            })
+        })();
+
+        match started {
+            Ok(recording) => Ok(recording),
+            Err(e) => {
+                rollback(&created);
+                Err(e)
+            }
+        }
     }
 
     /// Returns the shared Pipeline so callers (e.g., a force-stop
@@ -413,8 +579,13 @@ impl Recording {
         // state for the sum of these, so a slow stop needs to name which
         // stage is slow.
         let began = Instant::now();
+        // Every shutdown stage runs even after an earlier stage failed;
+        // the first failure is what stop() reports.
+        let mut first_err: Option<io::Error> = None;
         if let Some(mut capture) = self.capture.take() {
-            capture.stop()?;
+            if let Err(e) = capture.stop() {
+                first_err = Some(e);
+            }
         }
         crate::debug!(
             "stop: capture killed in {:.2}s",
@@ -422,26 +593,35 @@ impl Recording {
         );
 
         let at_readers = Instant::now();
-        let mic_result = self
-            .mic_reader
-            .join()
-            .map_err(|_| io::Error::other("mic reader thread panicked"))?;
-        let monitor_result = self
-            .monitor_reader
-            .join()
-            .map_err(|_| io::Error::other("monitor reader thread panicked"))?;
+        let reader_results = [
+            ("mic", self.mic_reader.join()),
+            ("monitor", self.monitor_reader.join()),
+        ];
         crate::debug!(
             "stop: readers joined in {:.2}s",
             at_readers.elapsed().as_secs_f64()
         );
+        for (name, result) in reader_results {
+            let reader_result =
+                result.map_err(|_| io::Error::other(format!("{name} reader thread panicked")));
+            // A reader's own error (stream died, wav write failed) is
+            // the interesting one; the panic mapping above only covers
+            // the join itself. Record the first failure in stage order.
+            if let Err(e) = reader_result.and_then(|inner| inner) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
 
         let at_submissions = Instant::now();
         let pending = self.submissions.pending();
         self.submissions.close();
+        let mut panicked_workers = 0usize;
         for handle in self.submission_workers {
-            handle
-                .join()
-                .map_err(|_| io::Error::other("segment submission worker panicked"))?;
+            if handle.join().is_err() {
+                panicked_workers += 1;
+            }
         }
         crate::debug!(
             "stop: {pending} queued submissions drained in {:.2}s",
@@ -456,17 +636,29 @@ impl Recording {
             began.elapsed().as_secs_f64()
         );
 
-        mic_result?;
-        monitor_result?;
+        if first_err.is_none() && panicked_workers > 0 {
+            first_err = Some(io::Error::other(format!(
+                "{panicked_workers} segment submission worker(s) panicked"
+            )));
+        }
 
         self.meta.duration_secs = Some(self.start.elapsed().as_secs());
         self.meta.segment_count = Some(
             crate::store::count_segment_lines(&self.store_dir.join("segments.jsonl")).unwrap_or(0)
                 as u64,
         );
-        write_meta(&self.store_dir.join("meta.json"), &self.meta)?;
+        // Every shutdown stage runs even after an earlier stage failed;
+        // the first failure is what stop() reports.
+        if let Err(e) = write_meta(&self.store_dir.join("meta.json"), &self.meta) {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
 
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -514,7 +706,7 @@ fn run_reader<R: io::Read>(
     let mut samples_read: u64 = 0;
     let mut segments_closed: u32 = 0;
 
-    tee_pcm_to_wav(source, &mut wav, |chunk| {
+    let stream_result = tee_pcm_to_wav(source, &mut wav, |chunk| {
         buffer.extend_from_slice(chunk);
         samples_read += chunk.len() as u64;
         for event in segmenter.push_samples(chunk) {
@@ -558,7 +750,26 @@ fn run_reader<R: io::Read>(
             &mut drained,
             open_span_start.unwrap_or(last_closed_end),
         );
-    })?;
+    });
+
+    if let Err(read_err) = stream_result {
+        // A span still open when the stream died will never produce a
+        // Segment: retire its watermark so it cannot gate the flush of
+        // every later segment forever.
+        if let Some(start_sample) = open_span_start {
+            let start_ms = segmenter::to_ms(start_sample);
+            if let Err(cancel_err) = pipeline.cancel_pending(start_ms) {
+                crate::debug!(
+                    "reader {speaker_tag:?}: cancel_pending at {start_ms}ms: {cancel_err:?}"
+                );
+            }
+        }
+        // Keep whatever PCM made it to disk readable.
+        if let Err(finalize_err) = wav.finalize() {
+            crate::debug!("reader {speaker_tag:?}: finalizing partial wav: {finalize_err:?}");
+        }
+        return Err(read_err);
+    }
 
     if let Some(span) = segmenter.finish() {
         // Its Opened event already fired earlier, when this trailing

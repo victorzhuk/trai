@@ -19,6 +19,15 @@ pub enum Record {
 
 pub struct Store {
     writer: File,
+    // File length up to the last record that fully landed. A write_all
+    // that failed partway leaves a fragment past this mark; the next
+    // append truncates it before writing, since that record never
+    // fully landed and is about to be rewritten anyway.
+    clean_len: u64,
+    // A completed write whose sync_data failed: the row is in the file,
+    // so retrying would duplicate it, but its durability is unproven.
+    // Sticky until `take_durability_error` surfaces it to the caller.
+    durable_failure: Option<io::Error>,
 }
 
 impl Store {
@@ -26,10 +35,51 @@ impl Store {
         // Transcripts hold meeting content: owner-only from creation.
         let writer = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(0o600)
             .open(path)?;
-        Ok(Self { writer })
+        // A previous run may have died mid-write_all, leaving an
+        // unterminated fragment at EOF. A fragment is a partial record
+        // that never fully landed, so truncating it back to the last
+        // newline loses nothing and keeps every later append on its own
+        // line.
+        let mut len = writer.metadata()?.len();
+        if len > 0 {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut handle = writer.try_clone()?;
+            let mut scan_from = len;
+            let mut last_newline: Option<u64> = None;
+            const CHUNK: u64 = 4096;
+            while last_newline.is_none() && scan_from > 0 {
+                let chunk_len = CHUNK.min(scan_from);
+                scan_from -= chunk_len;
+                handle.seek(SeekFrom::Start(scan_from))?;
+                let mut buf = vec![0u8; chunk_len as usize];
+                handle.read_exact(&mut buf)?;
+                if let Some(pos) = buf.iter().rposition(|&b| b == b'\n') {
+                    last_newline = Some(scan_from + pos as u64 + 1);
+                }
+            }
+            let clean_len = last_newline.unwrap_or(0);
+            if clean_len != len {
+                handle.set_len(clean_len)?;
+                handle.seek(SeekFrom::End(0))?;
+                len = clean_len;
+            }
+        }
+        Ok(Self {
+            writer,
+            clean_len: len,
+            durable_failure: None,
+        })
+    }
+
+    // Drains the sticky durability failure from a sync_data that failed
+    // after a completed write. The rows are already in the file; this
+    // only reports that their durability was never proven.
+    pub fn take_durability_error(&mut self) -> Option<io::Error> {
+        self.durable_failure.take()
     }
 
     pub fn append(&mut self, segment: &Segment) -> io::Result<()> {
@@ -37,17 +87,48 @@ impl Store {
     }
 
     pub fn append_record(&mut self, record: &Record) -> io::Result<()> {
-        let line = serde_json::to_string(record).map_err(io::Error::other)?;
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
-        self.writer.sync_data()?;
-        Ok(())
+        let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
+        line.push('\n');
+        {
+            use std::io::{Seek, SeekFrom};
+            if self.writer.metadata()?.len() > self.clean_len {
+                // A previously failed write_all left a fragment at EOF.
+                // It never fully landed, so truncate it back to the last
+                // clean record rather than terminating it into a
+                // malformed line.
+                self.writer.set_len(self.clean_len)?;
+                self.writer.seek(SeekFrom::End(0))?;
+            }
+        }
+        match self.writer.write_all(line.as_bytes()) {
+            Ok(()) => {
+                // The record is now entirely in the file. A File keeps
+                // no userspace buffer, so the only remaining failure is
+                // sync_data, which questions durability, not the
+                // append: reporting Err here would make callers retry
+                // and write a duplicate row. The failure is instead
+                // held on the Store and surfaced through
+                // `take_durability_error` so no durability loss is
+                // silent.
+                self.clean_len += line.len() as u64;
+                if let Err(e) = self.writer.sync_data() {
+                    self.durable_failure = Some(e);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
 pub fn read_all(path: &Path) -> io::Result<Vec<Segment>> {
     let content = fs::read_to_string(path)?;
+    // The only malformed line a healthy Store can produce is a torn
+    // append: a single unterminated fragment at EOF (the next append
+    // terminates it, read_all sees it as the last line). Any other
+    // parse failure is real corruption and must be an explicit error,
+    // not a silent skip.
+    let ends_with_newline = content.ends_with('\n');
     let lines: Vec<&str> = content
         .split('\n')
         .filter(|line| !line.is_empty())
@@ -57,7 +138,7 @@ pub fn read_all(path: &Path) -> io::Result<Vec<Segment>> {
     let mut index_by_id: HashMap<u64, usize> = HashMap::new();
     let mut translations_by_id: HashMap<u64, (String, bool)> = HashMap::new();
 
-    for (i, line) in lines.iter().enumerate() {
+    for (position, line) in lines.iter().enumerate() {
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Segment(mut segment)) => {
                 if let Some((text, degraded)) = translations_by_id.get(&segment.id) {
@@ -79,10 +160,18 @@ pub fn read_all(path: &Path) -> io::Result<Vec<Segment>> {
                 }
             }
             Err(e) => {
-                if i == lines.len() - 1 {
-                    break;
+                let torn_fragment = !ends_with_newline && position == lines.len() - 1;
+                if torn_fragment {
+                    continue;
                 }
-                return Err(io::Error::other(e));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt transcript record at line {} ({} readable records precede it): {e}",
+                        position + 1,
+                        segments.len()
+                    ),
+                ));
             }
         }
     }
@@ -349,6 +438,110 @@ mod tests {
         assert_eq!(
             read_back[1].translation.as_deref(),
             Some("seg2 translation")
+        );
+    }
+
+    #[test]
+    fn append_after_a_torn_write_truncates_the_fragment_and_stays_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let seg1 = make_segment(1);
+        let seg2 = make_segment(2);
+
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&seg1).unwrap();
+
+        // Simulate the EOF state a failed write_all leaves behind: a
+        // partial record with no terminating newline.
+        {
+            use std::io::Write as _;
+            let mut handle = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            handle.write_all(br#"{"kind":"seg"#).unwrap();
+        }
+
+        store.append(&seg2).unwrap();
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back, vec![seg1, seg2]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().matches('\n').count(),
+            2,
+            "the fragment must be truncated, not terminated into a malformed line"
+        );
+    }
+
+    #[test]
+    fn reopen_truncates_an_unterminated_fragment_left_by_a_previous_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let seg1 = make_segment(1);
+        let seg2 = make_segment(2);
+
+        {
+            let mut store = super::Store::open(&path).unwrap();
+            store.append(&seg1).unwrap();
+        }
+        // Crash mid-write: a partial record without its newline.
+        {
+            use std::io::Write as _;
+            let mut handle = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            handle
+                .write_all(br#"{"kind":"segment","id":3,"text":"par"#)
+                .unwrap();
+        }
+
+        // Reopen must inspect the last byte and repair the fragment so
+        // the next append never fuses onto it.
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&seg2).unwrap();
+
+        let read_back = super::read_all(&path).unwrap();
+        assert_eq!(read_back, vec![seg1, seg2]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().matches('\n').count(),
+            2,
+            "exactly two terminated records, no fused line"
+        );
+    }
+
+    #[test]
+    fn reopen_with_fresh_file_and_after_clean_close_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let seg1 = make_segment(1);
+        let seg2 = make_segment(2);
+
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&seg1).unwrap();
+        drop(store);
+
+        let mut store = super::Store::open(&path).unwrap();
+        store.append(&seg2).unwrap();
+
+        assert_eq!(super::read_all(&path).unwrap(), vec![seg1, seg2]);
+    }
+
+    #[test]
+    fn corrupt_mid_file_record_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        let seg1 = make_segment(1);
+        let mut raw = serde_json::to_string(&Record::Segment(seg1)).unwrap();
+        raw.push('\n');
+        raw.push_str("{\"kind\":\"segment\",\"id\":2,not json\n");
+        raw.push_str(&serde_json::to_string(&Record::Segment(make_segment(3))).unwrap());
+        raw.push('\n');
+        fs::write(&path, raw).unwrap();
+
+        let err = super::read_all(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("line 2"),
+            "error must name the corrupt line: {err}"
         );
     }
 

@@ -22,6 +22,10 @@ pub struct SegmentInput {
 pub enum PipelineError {
     Transcribe(TranscribeError),
     Store(std::io::Error),
+    // A record landed in the store but its durability could not be
+    // proven. Retrying the append would duplicate the row, so the
+    // caller gets this outcome instead.
+    Durability(std::io::Error),
 }
 
 impl fmt::Display for PipelineError {
@@ -29,6 +33,9 @@ impl fmt::Display for PipelineError {
         match self {
             PipelineError::Transcribe(e) => write!(f, "transcription failed: {e}"),
             PipelineError::Store(e) => write!(f, "store append failed: {e}"),
+            PipelineError::Durability(e) => {
+                write!(f, "record appended but durability unproven: {e}")
+            }
         }
     }
 }
@@ -110,6 +117,17 @@ impl Persisted {
             ready += 1;
         }
         self.transcript.drain(..ready).collect()
+    }
+
+    // Puts an unflushed batch back into `transcript` after a failed
+    // append, so nothing is silently dropped and a later flush retries
+    // it. Re-inserted by start_ms rather than spliced at the head: a
+    // completion with a smaller start_ms can land while the batch is in
+    // flight, and the Vec must stay sorted.
+    fn restore_prefix(&mut self, batch: Vec<Segment>) {
+        for segment in batch {
+            insert_ordered(&mut self.transcript, segment);
+        }
     }
 
     // The row was inserted at this Segment's start_ms when it closed and
@@ -232,6 +250,12 @@ pub trait SegmentSink: Send {
         text: &str,
         degraded: bool,
     ) -> std::io::Result<()>;
+
+    // Drains a sticky durability failure left by a completed-but-unsynced
+    // append. Sinks that cannot hit this return None.
+    fn take_durability_error(&mut self) -> Option<std::io::Error> {
+        None
+    }
 }
 
 impl SegmentSink for Store {
@@ -290,6 +314,12 @@ pub struct Pipeline {
     // keep running in the background and finish on their own; the
     // caller just stops blocking on them.
     force_stop: AtomicBool,
+    // Serializes live-view mutation + callback pairs: an update's index
+    // is computed and delivered while this lock is held, so a concurrent
+    // insert/remove can't shift indices in between. Order is always
+    // fire_lock -> persisted, and the callback never runs under
+    // `persisted` so reader threads aren't blocked behind it.
+    fire_lock: Arc<Mutex<()>>,
 }
 
 impl Pipeline {
@@ -309,11 +339,13 @@ impl Pipeline {
         }));
         let store: Arc<Mutex<dyn SegmentSink>> = Arc::new(Mutex::new(sink));
         let on_update = Arc::new(Mutex::new(None));
+        let fire_lock = Arc::new(Mutex::new(()));
         let scheduler = TranslationScheduler::new(
             translator,
             persisted.clone(),
             store.clone(),
             on_update.clone(),
+            fire_lock.clone(),
             target_language.clone(),
         );
 
@@ -327,6 +359,7 @@ impl Pipeline {
             on_update,
             scheduler,
             force_stop: AtomicBool::new(false),
+            fire_lock,
         }
     }
 
@@ -372,15 +405,17 @@ impl Pipeline {
             state: SegmentState::Transcribing,
             translation_error: None,
         };
-        let update = {
-            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
-            let index = persisted.insert_live_row(placeholder.clone());
-            TranscriptUpdate::Insert {
+        {
+            let _ordered = self.fire_lock.lock().expect("fire mutex poisoned");
+            let index = {
+                let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+                persisted.insert_live_row(placeholder.clone())
+            };
+            self.fire(TranscriptUpdate::Insert {
                 index,
                 segment: placeholder,
-            }
-        };
-        self.fire(update);
+            });
+        }
 
         let outcome = self
             .transcriber
@@ -389,97 +424,116 @@ impl Pipeline {
         let transcription = match outcome {
             Ok(transcription) => transcription,
             Err(e) => {
-                let update = {
-                    let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
-                    persisted.retire_in_flight(input.start_ms);
-                    persisted
-                        .fail_live_row(segment_id, e.to_string())
-                        .map(|index| TranscriptUpdate::Replace {
-                            index,
-                            segment: persisted.live_view[index].clone(),
-                        })
-                };
-                // The failed row is worth more on screen than the flush
-                // result is, so it goes out before the error propagates.
-                if let Some(update) = update {
-                    self.fire(update);
+                {
+                    let _ordered = self.fire_lock.lock().expect("fire mutex poisoned");
+                    let update = {
+                        let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+                        persisted.retire_in_flight(input.start_ms);
+                        persisted
+                            .fail_live_row(segment_id, e.to_string())
+                            .map(|index| TranscriptUpdate::Replace {
+                                index,
+                                segment: persisted.live_view[index].clone(),
+                            })
+                    };
+                    // The failed row is worth more on screen than the
+                    // flush result is, so it goes out before the error
+                    // propagates.
+                    if let Some(update) = update {
+                        self.fire(update);
+                    }
                 }
-                self.flush_ready()?;
+                // A flush failure here must not replace the transcribe
+                // error the caller actually cares about; the batch stays
+                // in `transcript` for a later flush either way.
+                if let Err(flush) = self.flush_ready() {
+                    crate::debug!("flush after transcribe failure: {flush}");
+                }
                 return Err(e.into());
             }
         };
 
         let mut translation_job = None;
-        let update = {
-            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
-            persisted.retire_in_flight(input.start_ms);
+        {
+            let _ordered = self.fire_lock.lock().expect("fire mutex poisoned");
+            let update = {
+                let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+                persisted.retire_in_flight(input.start_ms);
 
-            let segment = Segment {
-                id: segment_id,
-                speaker_tag: input.speaker_tag,
-                start_ms: input.start_ms,
-                end_ms: input.end_ms,
-                text: transcription.text,
-                mean_confidence: transcription.mean_confidence,
-                source_language: configured_language.or(transcription.language),
-                translation: None,
-                degraded: false,
-                state: SegmentState::Ready,
-                translation_error: None,
+                let segment = Segment {
+                    id: segment_id,
+                    speaker_tag: input.speaker_tag,
+                    start_ms: input.start_ms,
+                    end_ms: input.end_ms,
+                    text: transcription.text,
+                    mean_confidence: transcription.mean_confidence,
+                    source_language: configured_language.or(transcription.language),
+                    translation: None,
+                    degraded: false,
+                    state: SegmentState::Ready,
+                    translation_error: None,
+                };
+
+                if passes_floor(&segment, self.confidence_floor) {
+                    crate::debug!(
+                        "segment {} {:?} {}ms conf={:.2} lang={} \"{}\"",
+                        segment.id,
+                        segment.speaker_tag,
+                        segment.start_ms,
+                        segment.mean_confidence,
+                        segment.source_language.as_deref().unwrap_or("?"),
+                        crate::log::preview(&segment.text, 60),
+                    );
+                    if segment.is_target_language(&self.target_language) {
+                        crate::debug!(
+                            "segment {} already in {}, not translated",
+                            segment.id,
+                            self.target_language,
+                        );
+                    } else {
+                        translation_job = Some((segment_id, segment.text.clone()));
+                    }
+                    insert_ordered(&mut persisted.transcript, segment.clone());
+                    let (index, replaced) = persisted.replace_live_row(segment.clone());
+                    if replaced {
+                        Some(TranscriptUpdate::Replace { index, segment })
+                    } else {
+                        Some(TranscriptUpdate::Insert { index, segment })
+                    }
+                } else {
+                    // Dropped here and nowhere else: without this line the
+                    // segment leaves no trace at all, in the UI or on disk.
+                    crate::debug!(
+                        "segment {} {:?} {}ms DROPPED conf={:.2} < floor={:.2} \"{}\"",
+                        segment.id,
+                        segment.speaker_tag,
+                        segment.start_ms,
+                        segment.mean_confidence,
+                        self.confidence_floor,
+                        crate::log::preview(&segment.text, 60),
+                    );
+                    persisted
+                        .drop_live_row(segment_id)
+                        .map(|index| TranscriptUpdate::Remove { index })
+                }
             };
 
-            if passes_floor(&segment, self.confidence_floor) {
-                crate::debug!(
-                    "segment {} {:?} {}ms conf={:.2} lang={} \"{}\"",
-                    segment.id,
-                    segment.speaker_tag,
-                    segment.start_ms,
-                    segment.mean_confidence,
-                    segment.source_language.as_deref().unwrap_or("?"),
-                    crate::log::preview(&segment.text, 60),
-                );
-                if segment.is_target_language(&self.target_language) {
-                    crate::debug!(
-                        "segment {} already in {}, not translated",
-                        segment.id,
-                        self.target_language,
-                    );
-                } else {
-                    translation_job = Some((segment_id, segment.text.clone()));
-                }
-                insert_ordered(&mut persisted.transcript, segment.clone());
-                let (index, replaced) = persisted.replace_live_row(segment.clone());
-                if replaced {
-                    Some(TranscriptUpdate::Replace { index, segment })
-                } else {
-                    Some(TranscriptUpdate::Insert { index, segment })
-                }
-            } else {
-                // Dropped here and nowhere else: without this line the
-                // segment leaves no trace at all, in the UI or on disk.
-                crate::debug!(
-                    "segment {} {:?} {}ms DROPPED conf={:.2} < floor={:.2} \"{}\"",
-                    segment.id,
-                    segment.speaker_tag,
-                    segment.start_ms,
-                    segment.mean_confidence,
-                    self.confidence_floor,
-                    crate::log::preview(&segment.text, 60),
-                );
-                persisted
-                    .drop_live_row(segment_id)
-                    .map(|index| TranscriptUpdate::Remove { index })
+            // Fired before flush_ready so a store failure can't swallow
+            // the UI update; the row on screen is filled either way.
+            if let Some(update) = update {
+                self.fire(update);
             }
-        };
-
-        self.flush_ready()?;
-        if let Some(update) = update {
-            self.fire(update);
         }
 
+        // Scheduled before flush_ready for the same reason: a failed
+        // append must not leave the row untranslated forever. A
+        // translation record can reach the store before its Segment
+        // record; read_all merges either order.
         if let Some((segment_id, text)) = translation_job {
             self.scheduler.schedule(segment_id, text);
         }
+
+        self.flush_ready()?;
 
         Ok(())
     }
@@ -495,15 +549,28 @@ impl Pipeline {
 
     // Appends every Segment whose watermark gate has opened, in
     // transcript order. The batch is taken under the persisted lock
-    // (no I/O) and written under the store lock only.
+    // (no I/O) and written under the store lock only. A failed append
+    // puts the unwritten tail (the failed record included) back into
+    // `transcript` while the store lock is still held: releasing it
+    // first would let a concurrent flush append a later batch ahead of
+    // the restored earlier rows, breaking on-disk start_ms order.
     fn flush_ready(&self) -> Result<(), PipelineError> {
         let mut store = self.store.lock().expect("store mutex poisoned");
         let batch = {
             let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
             persisted.take_ready_prefix()
         };
-        for segment in &batch {
-            store.append_segment(segment)?;
+        for (attempted, segment) in batch.iter().enumerate() {
+            if let Err(e) = store.append_segment(segment) {
+                self.persisted
+                    .lock()
+                    .expect("pipeline mutex poisoned")
+                    .restore_prefix(batch[attempted..].to_vec());
+                return Err(e.into());
+            }
+        }
+        if let Some(e) = store.take_durability_error() {
+            return Err(PipelineError::Durability(e));
         }
         Ok(())
     }
@@ -520,6 +587,18 @@ impl Pipeline {
 
     pub fn drain_translations(&self) {
         self.scheduler.drain(&self.force_stop);
+    }
+
+    /// Retires the in-flight watermark registered by `begin` for a span
+    /// that will never produce a Segment (its Stream went away before
+    /// `finish_pending`), then flushes whatever that unblocks. Unknown
+    /// start_ms is a no-op.
+    pub fn cancel_pending(&self, start_ms: u64) -> Result<(), PipelineError> {
+        {
+            let mut persisted = self.persisted.lock().expect("pipeline mutex poisoned");
+            persisted.retire_in_flight(start_ms);
+        }
+        self.flush_ready()
     }
 
     fn fire(&self, update: TranscriptUpdate) {
@@ -796,6 +875,7 @@ mod tests {
             pipeline.persisted.clone(),
             pipeline.store.clone(),
             on_update.clone(),
+            pipeline.fire_lock.clone(),
             123,
             "ignored".to_string(),
             false,
@@ -824,6 +904,7 @@ mod tests {
         TranslationScheduler::record_translation_error(
             pipeline.persisted.clone(),
             on_update.clone(),
+            pipeline.fire_lock.clone(),
             123,
             "ignored".to_string(),
         )
@@ -944,6 +1025,7 @@ mod tests {
             pipeline.persisted.clone(),
             pipeline.store.clone(),
             on_update,
+            pipeline.fire_lock.clone(),
             1,
             "t1".to_string(),
             false,
@@ -1516,6 +1598,496 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "drain_translations after force_stop must return quickly, took {elapsed:?}"
         );
+    }
+
+    // Fails the first N segment appends, then records everything: lets
+    // the retry-after-failed-flush path be tested without /dev/full.
+    struct FlakySink {
+        state: Arc<Mutex<SinkState>>,
+    }
+
+    struct SinkState {
+        failures_left: u32,
+        // Simulates a completed write whose sync_data failed.
+        durability_failures_left: u32,
+        durability_error: Option<std::io::Error>,
+        written: Vec<Segment>,
+    }
+
+    impl SegmentSink for FlakySink {
+        fn append_segment(&mut self, segment: &Segment) -> std::io::Result<()> {
+            let mut state = self.state.lock().expect("sink state mutex poisoned");
+            if state.failures_left > 0 {
+                state.failures_left -= 1;
+                return Err(std::io::Error::other("sink failing"));
+            }
+            if state.durability_failures_left > 0 {
+                state.durability_failures_left -= 1;
+                state.durability_error = Some(std::io::Error::other("fsync failed"));
+            }
+            state.written.push(segment.clone());
+            Ok(())
+        }
+
+        fn append_translation(
+            &mut self,
+            _segment_id: u64,
+            _text: &str,
+            _degraded: bool,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn take_durability_error(&mut self) -> Option<std::io::Error> {
+            let mut state = self.state.lock().expect("sink state mutex poisoned");
+            state.durability_error.take()
+        }
+    }
+
+    #[test]
+    fn unproven_durability_is_surfaced_without_duplicate_writes() {
+        let state = Arc::new(Mutex::new(SinkState {
+            failures_left: 0,
+            durability_failures_left: 1,
+            durability_error: None,
+            written: Vec::new(),
+        }));
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber,
+            translator,
+            FlakySink {
+                state: state.clone(),
+            },
+            0.0,
+            "en",
+        ));
+
+        let segment = Segment {
+            id: 1,
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            text: "segment 1".to_string(),
+            mean_confidence: 0.95,
+            source_language: None,
+            translation: None,
+            degraded: false,
+            state: SegmentState::Ready,
+            translation_error: None,
+        };
+        pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .transcript
+            .push(segment);
+
+        // The row landed, so the outcome is a typed durability error —
+        // not Ok (silent loss of the durability guarantee) and not a
+        // Store error (which would make the caller retry into a
+        // duplicate row).
+        let error = pipeline.flush_ready().unwrap_err();
+        assert!(
+            matches!(error, PipelineError::Durability(_)),
+            "expected Durability, got: {error}"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("sink state mutex poisoned")
+                .written
+                .len(),
+            1,
+            "the row was appended exactly once"
+        );
+        assert!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .transcript
+                .is_empty(),
+            "an appended row must not be re-queued for a duplicate write"
+        );
+
+        // Once the sticky error is drained, later flushes succeed.
+        pipeline.flush_ready().unwrap();
+    }
+
+    // Regression: after a failed append the unwritten tail must be
+    // restored while the store lock is still held, so no concurrent
+    // flush can append a later batch ahead of the restored earlier rows.
+    #[test]
+    fn failed_flush_restores_the_batch_before_releasing_the_store_lock() {
+        let state = Arc::new(Mutex::new(SinkState {
+            failures_left: 1,
+            durability_failures_left: 0,
+            durability_error: None,
+            written: Vec::new(),
+        }));
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Pipeline::new(
+            transcriber,
+            translator,
+            FlakySink {
+                state: state.clone(),
+            },
+            0.0,
+            "en",
+        );
+
+        let segments: Vec<Segment> = (1..=3)
+            .map(|id| Segment {
+                id,
+                speaker_tag: SpeakerTag::Me,
+                start_ms: id * 100,
+                end_ms: id * 100 + 50,
+                text: format!("segment {id}"),
+                mean_confidence: 0.95,
+                source_language: None,
+                translation: None,
+                degraded: false,
+                state: SegmentState::Ready,
+                translation_error: None,
+            })
+            .collect();
+        pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .transcript
+            .clone_from(&segments);
+
+        let error = pipeline.flush_ready().unwrap_err();
+        assert!(error.to_string().contains("store append failed"));
+
+        // The failed record and everything after it is back, in order,
+        // before the call returned.
+        let restored = pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .transcript
+            .clone();
+        assert_eq!(
+            restored.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+
+        // A later flush writes the whole batch in order, nothing ahead
+        // of the restored earlier rows.
+        pipeline.flush_ready().unwrap();
+        let written = state
+            .lock()
+            .expect("sink state mutex poisoned")
+            .written
+            .clone();
+        assert_eq!(
+            written.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+    }
+
+    #[test]
+    fn failed_flush_keeps_the_batch_and_a_later_flush_writes_it_in_order() {
+        let state = Arc::new(Mutex::new(SinkState {
+            failures_left: 1,
+            durability_failures_left: 0,
+            durability_error: None,
+            written: Vec::new(),
+        }));
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator,
+            FlakySink {
+                state: state.clone(),
+            },
+            0.0,
+            "en",
+        ));
+
+        // First submission: its flush fails, and the segment must stay
+        // queued for a retry instead of vanishing.
+        let first_samples = vec![1i16; 8];
+        let first_call = transcriber.expect_call(first_samples.clone());
+        let first_input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            samples: first_samples,
+            language: None,
+        };
+        let pipeline_first = pipeline.clone();
+        let first_handle = thread::spawn(move || pipeline_first.submit(first_input));
+        first_call.respond(Transcription {
+            text: "segment 1".to_string(),
+            mean_confidence: 0.95,
+            language: None,
+        });
+        let first_error = first_handle.join().unwrap().unwrap_err();
+        assert!(first_error.to_string().contains("store append failed"));
+
+        assert!(
+            state
+                .lock()
+                .expect("sink state mutex poisoned")
+                .written
+                .is_empty(),
+            "the failed append must not be counted as written"
+        );
+        assert_eq!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .transcript
+                .len(),
+            1,
+            "the failed segment must stay queued for a later flush"
+        );
+
+        // Second submission succeeds and must flush BOTH segments, in
+        // start_ms order.
+        let second_samples = vec![2i16; 8];
+        let second_call = transcriber.expect_call(second_samples.clone());
+        let second_input = SegmentInput {
+            speaker_tag: SpeakerTag::Them,
+            start_ms: 1_000,
+            end_ms: 1_400,
+            samples: second_samples,
+            language: None,
+        };
+        let pipeline_second = pipeline.clone();
+        let second_handle = thread::spawn(move || pipeline_second.submit(second_input));
+        second_call.respond(Transcription {
+            text: "segment 2".to_string(),
+            mean_confidence: 0.95,
+            language: None,
+        });
+        second_handle.join().unwrap().unwrap();
+
+        let written = state
+            .lock()
+            .expect("sink state mutex poisoned")
+            .written
+            .clone();
+        assert_eq!(
+            written.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
+            vec![0, 1_000],
+            "the retried batch must keep record order with nothing dropped"
+        );
+        assert!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .transcript
+                .is_empty(),
+            "everything written must leave the unflushed queue"
+        );
+    }
+
+    #[test]
+    fn flush_failure_does_not_swallow_the_ui_update_or_translation_schedule() {
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator.clone(),
+            FailingSink,
+            0.0,
+            "en",
+        ));
+
+        let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
+        pipeline.set_on_update(folding_callback(snapshots.clone()));
+
+        let samples = vec![3i16; 8];
+        let transcribe_call = transcriber.expect_call(samples.clone());
+        let _translate_call = translator.expect_call("segment 1");
+        let input = SegmentInput {
+            speaker_tag: SpeakerTag::Me,
+            start_ms: 0,
+            end_ms: 400,
+            samples,
+            language: None,
+        };
+
+        let pipeline_for_thread = pipeline.clone();
+        let handle = thread::spawn(move || pipeline_for_thread.submit(input));
+        transcribe_call.respond(Transcription {
+            text: "segment 1".to_string(),
+            mean_confidence: 0.95,
+            language: None,
+        });
+        handle.join().unwrap().unwrap_err();
+
+        let final_snapshot = snapshots.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(final_snapshot.len(), 1);
+        assert_eq!(final_snapshot[0].state, SegmentState::Ready);
+        assert_eq!(final_snapshot[0].text, "segment 1");
+        assert_eq!(
+            final_snapshot[0].translation, None,
+            "a translation persist that fails must not fake a translation"
+        );
+
+        // The translation job must still have been scheduled even
+        // though every append fails.
+        wait_until(|| translator.recorded_calls().len() == 1);
+        pipeline.signal_force_stop();
+        pipeline.drain_translations();
+    }
+
+    #[test]
+    fn cancel_pending_retires_the_watermark_and_flushes_what_it_unblocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let store = Store::open(&path).unwrap();
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator,
+            store,
+            0.0,
+            "en",
+        ));
+
+        // An open span at 0ms that never closes: its watermark must
+        // hold back the completed later segment.
+        pipeline.begin(0);
+
+        let samples = vec![4i16; 8];
+        let transcribe_call = transcriber.expect_call(samples.clone());
+        let input = SegmentInput {
+            speaker_tag: SpeakerTag::Them,
+            start_ms: 1_000,
+            end_ms: 1_400,
+            samples,
+            language: None,
+        };
+        let pipeline_for_thread = pipeline.clone();
+        let handle = thread::spawn(move || pipeline_for_thread.submit(input));
+        transcribe_call.respond(Transcription {
+            text: "later".to_string(),
+            mean_confidence: 0.95,
+            language: None,
+        });
+        handle.join().unwrap().unwrap();
+
+        assert!(
+            fs::read_to_string(&path).unwrap().is_empty(),
+            "the orphan watermark must gate the flush"
+        );
+
+        pipeline.cancel_pending(0).unwrap();
+
+        let on_disk = crate::store::read_all(&path).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].text, "later");
+        assert!(
+            pipeline
+                .persisted
+                .lock()
+                .expect("pipeline mutex poisoned")
+                .in_flight
+                .is_empty(),
+            "cancel_pending must retire the orphan watermark"
+        );
+    }
+
+    // With the callback delivered while the same lock that produced its
+    // index is held, a mirror folding the update stream concurrently
+    // with row mutations must match the live view exactly: a stale or
+    // out-of-range index would panic the fold or desync the mirror.
+    #[test]
+    fn concurrent_row_mutations_and_inserts_deliver_consistent_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let store = Store::open(&path).unwrap();
+        let transcriber = Arc::new(FakeTranscriber::new());
+        let translator = Arc::new(FakeTranslator::new());
+        let pipeline = Arc::new(Pipeline::new(
+            transcriber.clone(),
+            translator,
+            store,
+            0.0,
+            "en",
+        ));
+
+        let snapshots: Arc<Mutex<Vec<Vec<Segment>>>> = Arc::new(Mutex::new(Vec::new()));
+        pipeline.set_on_update(folding_callback(snapshots.clone()));
+
+        const SEGMENTS: u64 = 24;
+
+        // Hammer translation-row mutations from another thread while
+        // submissions insert and replace rows.
+        let stop = Arc::new(AtomicU64::new(0));
+        let hammer_stop = stop.clone();
+        let hammer = {
+            let persisted = pipeline.persisted.clone();
+            let store = pipeline.store.clone();
+            let on_update = pipeline.on_update.clone();
+            let fire_lock = pipeline.fire_lock.clone();
+            thread::spawn(move || {
+                while hammer_stop.load(Ordering::SeqCst) == 0 {
+                    for id in 1..=SEGMENTS {
+                        let _ = TranslationScheduler::record_translation(
+                            persisted.clone(),
+                            store.clone(),
+                            on_update.clone(),
+                            fire_lock.clone(),
+                            id,
+                            format!("t{id}"),
+                            false,
+                        );
+                    }
+                }
+            })
+        };
+
+        for id in 1..=SEGMENTS {
+            let samples = vec![id as i16; 8];
+            let transcribe_call = transcriber.expect_call(samples.clone());
+            let input = SegmentInput {
+                speaker_tag: SpeakerTag::Me,
+                start_ms: id * 100,
+                end_ms: id * 100 + 50,
+                samples,
+                language: None,
+            };
+            let pipeline_for_thread = pipeline.clone();
+            let handle = thread::spawn(move || pipeline_for_thread.submit(input));
+            transcribe_call.respond(Transcription {
+                text: format!("segment {id}"),
+                mean_confidence: 0.95,
+                language: None,
+            });
+            handle.join().unwrap().unwrap();
+        }
+
+        stop.store(1, Ordering::SeqCst);
+        hammer.join().unwrap();
+
+        let snaps = snapshots.lock().unwrap().clone();
+        for snap in &snaps {
+            assert!(
+                snap.windows(2).all(|w| w[0].start_ms <= w[1].start_ms),
+                "every snapshot folded from concurrent updates must stay sorted"
+            );
+        }
+        let live_view = pipeline
+            .persisted
+            .lock()
+            .expect("pipeline mutex poisoned")
+            .live_view
+            .clone();
+        assert_eq!(snaps.last().unwrap(), &live_view);
     }
 
     fn submit_and_translate(

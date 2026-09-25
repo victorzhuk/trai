@@ -17,6 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries no per-word probabilities, confidence falls back to the segment's
   `avg_logprob` instead of an unknown value.
 
+### Fixed
+
+- **Failed appends no longer drop a whole batch.** When a segment append
+  fails mid-batch, the pipeline restores the unwritten rows to its
+  in-memory queue so the next flush retries them in start-ms order; a row
+  that landed but could not be fsynced is reported as a typed
+  `Durability` error rather than a generic I/O error, so callers do not
+  retry into a duplicate write.
+- **Recording metadata writes are now atomic.** A temp-file plus
+  atomic rename plus directory fsync is used at both start and stop, so
+  a mid-recording interruption is more likely to leave a self-describing
+  recording on disk rather than a half-written file.
+- **Two recordings started in the same second get distinct directories.**
+  Recording directory creation uses an exclusive `mkdir` that retries
+  through candidates, so concurrent recordings no longer risk
+  truncating each other's files.
+- **Replay view acts on the open recording.** Starting a new recording
+  clears the replay target, so Delete in the history view always hits
+  the currently-open replay; segments transcribed but never translated
+  after stop render as `—` instead of a perpetually pending spinner.
+- **`/models` probe only accepts backends that serve the configured
+  model.** A 200 OK from the probe now counts as success only when the
+  configured model id appears in the returned list; endpoints that don't
+  return a list keep the status-only behavior.
+- **Trailing slash in `whisper_url` no longer doubles the path.** The
+  base URL is trimmed on client construction, so a configured
+  `https://host/` no longer produces a doubled-slash request to
+  `/inference` or `/audio/transcriptions`.
+
 ## [0.1.1] - 2026-07-27
 
 ### Fixed

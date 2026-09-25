@@ -11,7 +11,7 @@ use trai::config::{Config, TranslateBackendConfig};
 use trai::domain::Segment;
 use trai::history;
 use trai::pipeline::{Pipeline, TranscriptUpdate};
-use trai::recording::{Recording, RecordingParams};
+use trai::recording::{reserve_store_dir, Recording, RecordingParams};
 use trai::transcriber::{Transcriber, WhisperClient};
 use trai::transcript::{
     build_row, summarize, OriginalText, TranscriptRow as UiTranscriptRow, TranslationText,
@@ -88,7 +88,7 @@ fn transcript_model() -> Rc<VecModel<TranscriptRow>> {
 const PENDING: &str = "…";
 const NO_TRANSLATION: &str = "—";
 
-fn to_ui_row(segment: &Segment, target_language: &str) -> TranscriptRow {
+fn to_ui_row(segment: &Segment, target_language: &str, replay: bool) -> TranscriptRow {
     let row: UiTranscriptRow = build_row(segment, target_language);
 
     let (text, transcribing, text_failed) = match row.original {
@@ -102,6 +102,15 @@ fn to_ui_row(segment: &Segment, target_language: &str) -> TranscriptRow {
         TranslationText::Verbatim(text) => (text, false, true, false, false),
         TranslationText::Failed(message) => (message, false, false, false, true),
         TranslationText::Absent => (NO_TRANSLATION.to_string(), false, false, false, false),
+    };
+    // In a live transcript a Ready segment without a translation is
+    // work still in flight; once the recording has stopped it never
+    // will be, so replay renders that slot as terminal absent instead
+    // of an eternally spinning Pending.
+    let (translation, pending) = if replay && pending {
+        (NO_TRANSLATION.to_string(), false)
+    } else {
+        (translation, pending)
     };
 
     TranscriptRow {
@@ -122,7 +131,7 @@ fn to_ui_row(segment: &Segment, target_language: &str) -> TranscriptRow {
 fn to_ui_rows(segments: &[Segment], target_language: &str) -> Vec<TranscriptRow> {
     segments
         .iter()
-        .map(|segment| to_ui_row(segment, target_language))
+        .map(|segment| to_ui_row(segment, target_language, true))
         .collect()
 }
 
@@ -156,10 +165,10 @@ fn make_transcript_updater(
             let model = transcript_model();
             match update {
                 TranscriptUpdate::Insert { index, segment } => {
-                    model.insert(index, to_ui_row(&segment, &target_language));
+                    model.insert(index, to_ui_row(&segment, &target_language, false));
                 }
                 TranscriptUpdate::Replace { index, segment } => {
-                    model.set_row_data(index, to_ui_row(&segment, &target_language));
+                    model.set_row_data(index, to_ui_row(&segment, &target_language, false));
                 }
                 TranscriptUpdate::Remove { index } => {
                     model.remove(index);
@@ -320,6 +329,7 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
         let cfg_whisper_dialect = cfg_whisper_dialect.clone();
         let cfg_translate_backends = cfg_translate_backends.clone();
         let cfg_target_language = cfg_target_language.clone();
+        let replay_target = replay_target.clone();
         window.on_begin_clicked(move || {
             let w = match window_weak.upgrade() {
                 Some(w) => w,
@@ -360,9 +370,10 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 }
             };
             w.set_wizard_error("".into());
-            // Live rows accumulate incrementally from here; drop whatever
-            // a replay or a previous Recording left in the model.
-            transcript_model().set_vec(Vec::new());
+            // Nothing below mutates the visible transcript until the
+            // recording actually starts: a failed start or a wizard
+            // cancel must leave the previous view (live or replay)
+            // exactly as it was.
 
             let title = {
                 let t = w.get_wizard_title().to_string();
@@ -377,11 +388,13 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
                 }
             };
 
-            let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let store_dir = cfg_store_root.join(secs.to_string());
+            let store_dir = match reserve_store_dir(&cfg_store_root) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    w.set_status_text(format!("start failed: {e}").into());
+                    return;
+                }
+            };
 
             let params = RecordingParams::from_config(
                 &cfg_for_params,
@@ -434,6 +447,18 @@ fn run(config: Config) -> Result<(), slint::PlatformError> {
             match Recording::start(params, transcriber, translator, on_transcript_update) {
                 Ok(recording) => {
                     *recording_slot.borrow_mut() = Some(recording);
+                    // The new recording owns the view from here: drop
+                    // whatever a replay or a previous Recording left in
+                    // the model, and drop the replay target so Delete
+                    // can never wipe the old recording's directory.
+                    // A replayed Recording may also have used a
+                    // different target language; put the configured one
+                    // back for the live view.
+                    transcript_model().set_vec(Vec::new());
+                    *replay_target.borrow_mut() = None;
+                    w.set_replay_open(false);
+                    w.set_replay_title("".into());
+                    w.set_target_language(cfg_target_language.as_str().into());
                     w.set_wizard_open(false);
                     w.set_recording_active(true);
                     w.set_status_text("".into());
@@ -724,7 +749,7 @@ mod row_shape_tests {
 
     #[test]
     fn transcribing_row_sets_only_transcribing_and_pending() {
-        let row = to_ui_row(&segment(SegmentState::Transcribing), "en");
+        let row = to_ui_row(&segment(SegmentState::Transcribing), "en", false);
         assert!(row.transcribing);
         assert!(row.pending);
         assert!(!row.text_failed && !row.verbatim && !row.degraded && !row.error);
@@ -735,6 +760,7 @@ mod row_shape_tests {
         let row = to_ui_row(
             &segment(SegmentState::Failed("whisper returned 503".to_string())),
             "en",
+            false,
         );
         assert!(row.text_failed);
         assert!(!row.pending && !row.transcribing && !row.error);
@@ -747,7 +773,7 @@ mod row_shape_tests {
         let mut seg = segment(SegmentState::Ready);
         seg.translation = Some("hola".to_string());
         seg.degraded = true;
-        let row = to_ui_row(&seg, "en");
+        let row = to_ui_row(&seg, "en", false);
         assert_eq!(row.translation, "hola");
         assert!(row.degraded);
         assert!(!row.pending && !row.error && !row.verbatim);
@@ -757,7 +783,7 @@ mod row_shape_tests {
     fn translation_error_row_sets_error_with_the_message() {
         let mut seg = segment(SegmentState::Ready);
         seg.translation_error = Some("model 'x' not found".to_string());
-        let row = to_ui_row(&seg, "en");
+        let row = to_ui_row(&seg, "en", false);
         assert!(row.error);
         assert_eq!(row.translation, "model 'x' not found");
         assert!(!row.pending && !row.degraded);
@@ -767,7 +793,7 @@ mod row_shape_tests {
     fn same_language_row_is_verbatim_not_pending() {
         let mut seg = segment(SegmentState::Ready);
         seg.source_language = Some("en".to_string());
-        let row = to_ui_row(&seg, "en");
+        let row = to_ui_row(&seg, "en", false);
         assert!(row.verbatim);
         assert!(!row.pending);
         assert_eq!(row.translation, "hello");
@@ -775,8 +801,54 @@ mod row_shape_tests {
 
     #[test]
     fn ready_row_without_translation_is_pending() {
-        let row = to_ui_row(&segment(SegmentState::Ready), "en");
+        let row = to_ui_row(&segment(SegmentState::Ready), "en", false);
         assert!(row.pending);
         assert!(!row.verbatim && !row.error && !row.degraded);
+    }
+
+    #[test]
+    fn replay_row_without_translation_is_terminal_absent_not_pending() {
+        let row = to_ui_row(&segment(SegmentState::Ready), "en", true);
+        assert_eq!(row.translation, NO_TRANSLATION);
+        assert!(!row.pending);
+        assert!(!row.verbatim && !row.error && !row.degraded);
+    }
+
+    #[test]
+    fn replay_row_keeps_live_pending_semantics_when_not_replay() {
+        // Same segment on the live path must stay Pending: the
+        // translation may still arrive.
+        let live = to_ui_row(&segment(SegmentState::Ready), "en", false);
+        assert!(live.pending);
+        assert_eq!(live.translation, PENDING);
+    }
+
+    #[test]
+    fn replay_transcribing_row_shows_pending_text_but_absent_translation() {
+        let row = to_ui_row(&segment(SegmentState::Transcribing), "en", true);
+        assert_eq!(row.text, PENDING);
+        assert!(row.transcribing);
+        // The translation never arrived and never will: terminal.
+        assert_eq!(row.translation, NO_TRANSLATION);
+        assert!(!row.pending);
+    }
+
+    #[test]
+    fn replay_failed_and_translated_rows_are_unchanged() {
+        let failed = to_ui_row(
+            &segment(SegmentState::Failed("whisper returned 503".to_string())),
+            "en",
+            true,
+        );
+        assert!(failed.text_failed);
+        assert_eq!(failed.translation, NO_TRANSLATION);
+
+        let mut seg = segment(SegmentState::Ready);
+        seg.translation = Some("hola".to_string());
+        seg.degraded = true;
+        let translated = to_ui_row(&seg, "en", true);
+        assert_eq!(translated.translation, "hola");
+        assert!(translated.degraded);
+        assert!(!translated.pending);
     }
 }

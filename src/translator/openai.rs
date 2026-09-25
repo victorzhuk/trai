@@ -132,12 +132,50 @@ impl Translator for OpenAITranslator {
             .map_err(|e| TranslateError::unavailable(format!("probe request failed: {e}")))?;
 
         let status = response.status();
-        response.error_for_status().map_err(|_| {
+        let response = response.error_for_status().map_err(|_| {
             classify_status(status)(format!("probe request failed with status: {status}"))
         })?;
 
+        // A 200 alone is not recovery: the fallback chain would climb
+        // back to a server that is up but does not serve the configured
+        // model. When the endpoint reports a model list, the configured
+        // id must be in it; endpoints that do not report one keep the
+        // status-only behavior.
+        let raw_body = crate::http::read_body(response).map_err(|e| {
+            TranslateError::unavailable(format!("failed to read probe response: {e}"))
+        })?;
+        // A parsed `data` array is authoritative — an empty list means
+        // the model is not served; only a missing/unparseable list keeps
+        // the status-only fallback.
+        match models_listed(&raw_body) {
+            Some(ids) if !ids.iter().any(|id| id == &self.model) => {
+                return Err(TranslateError::misconfigured(format!(
+                    "probe: model {:?} not served by this endpoint (available: {})",
+                    self.model,
+                    ids.join(", ")
+                )));
+            }
+            _ => {}
+        }
+
         Ok(())
     }
+}
+
+// `Some(data[].id)` when the reply parses and carries a `data` array;
+// `None` when the list is missing or the body is unparseable, which
+// keeps the status-only fallback behavior.
+fn models_listed(raw_body: &str) -> Option<Vec<String>> {
+    serde_json::from_str::<Value>(raw_body)
+        .ok()
+        .and_then(|body| {
+            body.get("data")?.as_array().map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.get("id")?.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,8 +334,59 @@ Connection: close\r\n\
     }
 
     #[test]
-    fn probe_success_on_2xx() {
+    fn probe_success_when_models_list_contains_configured_model() {
+        let (address, server) = serve_response(
+            "HTTP/1.1 200 OK",
+            r#"{"data":[{"id":"other"},{"id":"gpt-4o-mini"}]}"#,
+        );
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
+
+        translator.probe().expect("probe should succeed");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_fails_when_configured_model_absent_from_models_list() {
+        let (address, server) =
+            serve_response("HTTP/1.1 200 OK", r#"{"data":[{"id":"something-else"}]}"#);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
+
+        let err = translator
+            .probe()
+            .expect_err("a 200 without the configured model must not pass the probe");
+
+        assert!(err.is_misconfigured());
+        assert!(err.to_string().contains("gpt-4o-mini"));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_fails_on_explicit_empty_models_list() {
+        // A parsed `data: []` is authoritative: the endpoint serves no
+        // models, so the configured model cannot be among them.
         let (address, server) = serve_response("HTTP/1.1 200 OK", r#"{"data":[]}"#);
+        let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
+            .expect("client build should succeed");
+
+        let err = translator
+            .probe()
+            .expect_err("an explicit empty list must not pass the probe");
+
+        assert!(err.is_misconfigured());
+        assert!(err.to_string().contains("gpt-4o-mini"));
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_tolerates_a_models_response_without_a_model_list() {
+        // Endpoints whose /models reply carries no usable list keep the
+        // old status-only behavior rather than blocking recovery.
+        let (address, server) = serve_response("HTTP/1.1 200 OK", r#"not json"#);
         let translator = OpenAITranslator::new(address, "gpt-4o-mini", "es", None, TEST_TIMEOUT)
             .expect("client build should succeed");
 

@@ -600,6 +600,349 @@ fn recording_drains_dead_audio_without_corrupting_later_segments() {
     }
 }
 
+// A source that streams its bytes normally, then fails hard: stands in
+// for pw-record dying mid-meeting with a span still open.
+struct FailingReader {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.data.len() {
+            let n = out.len().min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        Err(std::io::Error::other("mic pcm stream died"))
+    }
+}
+
+// The mic's span is still open when its stream errors; the monitor's
+// later-starting segment completed but was gated behind the orphan
+// watermark. The reader's cancel_pending must retire the watermark and
+// unblock the flush, stop() must surface the original reader error, the
+// partial wav must still be finalized, and meta.json must still gain
+// duration_secs — none of those may be skipped by the error path.
+#[test]
+fn reader_error_cancels_orphan_span_unblocks_flush_and_preserves_error() {
+    let mic_formants = [180.0, 420.0, 900.0, 1800.0, 2600.0];
+    let monitor_formants = [220.0, 500.0, 1100.0, 2000.0, 3000.0];
+
+    let mic_lead_silence_len = FRAME_LEN * 10;
+    let mic_speech_len = FRAME_LEN * 20;
+    let mic_trail_silence_len = FRAME_LEN * 40;
+
+    let mut mic_onset_samples = vec![0i16; mic_lead_silence_len];
+    mic_onset_samples.extend(synthetic_speech_frame(
+        mic_speech_len,
+        mic_lead_silence_len,
+        &mic_formants,
+    ));
+
+    let mut mic_full_samples = mic_onset_samples.clone();
+    mic_full_samples.extend(vec![0i16; mic_trail_silence_len]);
+
+    let mut monitor_samples = vec![0i16; FRAME_LEN * 40];
+    monitor_samples.extend(synthetic_speech_frame(
+        FRAME_LEN * 20,
+        FRAME_LEN * 40,
+        &monitor_formants,
+    ));
+    monitor_samples.extend(vec![0i16; FRAME_LEN * 40]);
+
+    // Only the monitor segment ever completes; the mic's open span has
+    // no expectation registered.
+    let monitor_span = expected_span(&monitor_samples);
+    let monitor_segment_samples = monitor_samples
+        [monitor_span.start_sample as usize..monitor_span.end_sample as usize]
+        .to_vec();
+
+    let fake = Arc::new(FakeTranscriber::new());
+    let monitor_call = fake.expect_call(monitor_segment_samples);
+    let translator = Arc::new(FakeTranslator::new());
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+    let segments_path = store_dir.join("segments.jsonl");
+
+    let params = RecordingParams {
+        store_dir: store_dir.clone(),
+        title: "test".to_string(),
+        mic_source: "unused".to_string(),
+        monitor_source: "unused".to_string(),
+        mic_language: None,
+        monitor_language: None,
+        target_language: "en".to_string(),
+        vad_threshold: VAD_THRESHOLD,
+        silence_hold_ms: SILENCE_HOLD_MS,
+        duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
+        confidence_floor: 0.0,
+    };
+
+    let mic_reader = FailingReader {
+        data: pcm_bytes(&mic_onset_samples),
+        pos: 0,
+    };
+
+    let recording = Recording::start_with_sources(
+        mic_reader,
+        Cursor::new(pcm_bytes(&monitor_samples)),
+        params,
+        fake.clone(),
+        translator,
+        |_segments| {},
+    )
+    .unwrap();
+
+    wait_until(|| fake.pending_count() == 0);
+    monitor_call.respond(Transcription {
+        text: "monitor said something".to_string(),
+        mean_confidence: 0.85,
+        language: None,
+    });
+    wait_until(|| !store::read_all(&segments_path).unwrap().is_empty());
+
+    let stop_err = recording.stop().unwrap_err();
+    assert!(
+        stop_err.to_string().contains("mic pcm stream died"),
+        "stop must surface the original reader error, got: {stop_err}"
+    );
+
+    let segments = store::read_all(&segments_path).unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "the completed monitor segment must be flushed once the orphan watermark is retired, got {segments:?}"
+    );
+    assert_eq!(segments[0].speaker_tag, SpeakerTag::Them);
+    assert_eq!(segments[0].text, "monitor said something");
+
+    let mic_wav = hound::WavReader::open(store_dir.join("mic.wav")).unwrap();
+    assert_eq!(
+        mic_wav.duration() as usize,
+        mic_onset_samples.len(),
+        "the partial mic wav must be finalized with the samples that arrived"
+    );
+
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store_dir.join("meta.json")).unwrap())
+            .unwrap();
+    assert!(
+        meta["duration_secs"].as_u64().is_some(),
+        "stop must write duration_secs into meta.json even when it returns an error"
+    );
+}
+
 fn segmenter_to_ms(sample: u64) -> u64 {
     sample * 1000 / SAMPLE_RATE_HZ
+}
+
+fn bare_params(store_dir: std::path::PathBuf, title: &str) -> RecordingParams {
+    RecordingParams {
+        store_dir,
+        title: title.to_string(),
+        mic_source: "unused".to_string(),
+        monitor_source: "unused".to_string(),
+        mic_language: Some("en".to_string()),
+        monitor_language: None,
+        target_language: "en".to_string(),
+        vad_threshold: VAD_THRESHOLD,
+        silence_hold_ms: SILENCE_HOLD_MS,
+        duration_cap_ms: DURATION_CAP_MS,
+        live_chunk_ms: DURATION_CAP_MS,
+        confidence_floor: 0.0,
+    }
+}
+
+fn start_recording(params: RecordingParams) -> std::io::Result<Recording> {
+    Recording::start_with_sources(
+        Cursor::new(Vec::new()),
+        Cursor::new(Vec::new()),
+        params,
+        Arc::new(FakeTranscriber::new()),
+        Arc::new(FakeTranslator::new()),
+        |_segments| {},
+    )
+}
+
+// Two processes handed the same dir: the loser must fail without
+// truncating the winner's meta.json or wav files.
+#[test]
+fn collided_store_dir_fails_without_truncating_existing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+    std::fs::create_dir(&store_dir).unwrap();
+    std::fs::write(store_dir.join("meta.json"), b"sentinel-meta").unwrap();
+    std::fs::write(store_dir.join("mic.wav"), b"sentinel-wav").unwrap();
+
+    let err = match start_recording(bare_params(store_dir.clone(), "test")) {
+        Err(e) => e,
+        Ok(_) => panic!("start must refuse an already-populated store dir"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(store_dir.join("meta.json")).unwrap(),
+        b"sentinel-meta"
+    );
+    assert_eq!(
+        std::fs::read(store_dir.join("mic.wav")).unwrap(),
+        b"sentinel-wav"
+    );
+}
+
+// The start-time meta write and the stop-time replacement both go
+// through temp+rename: the final file must be complete JSON with the
+// stop-only fields, no temp file may survive, and the owner-only mode
+// must hold on the renamed file.
+#[test]
+fn stop_replaces_meta_with_duration_and_leaves_no_temp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+
+    let recording = start_recording(bare_params(store_dir.clone(), "Replace Me")).unwrap();
+    recording.stop().unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    let meta_path = store_dir.join("meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["title"], "Replace Me");
+    assert!(meta["duration_secs"].as_u64().is_some());
+    assert_eq!(meta["segment_count"].as_u64(), Some(0));
+    let mode = meta_path.metadata().unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let leftovers: Vec<_> = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files survived: {leftovers:?}");
+}
+
+#[test]
+fn reserve_store_dir_hands_out_distinct_dirs_under_one_root() {
+    let root = tempfile::tempdir().unwrap();
+    let first = trai::recording::reserve_store_dir(root.path()).unwrap();
+    let second = trai::recording::reserve_store_dir(root.path()).unwrap();
+    assert_ne!(first, second);
+    assert!(first.is_dir() && second.is_dir());
+    let dirs: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dirs.len(), 2, "each reservation got its own dir: {dirs:?}");
+}
+
+#[test]
+fn stop_reports_reader_failure_even_when_meta_write_also_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+
+    let recording = Recording::start_with_sources(
+        FailingReader {
+            data: Vec::new(),
+            pos: 0,
+        },
+        Cursor::new(Vec::new()),
+        bare_params(store_dir.clone(), "test"),
+        Arc::new(FakeTranscriber::new()),
+        Arc::new(FakeTranslator::new()),
+        |_segments| {},
+    )
+    .unwrap();
+
+    std::fs::remove_file(store_dir.join("meta.json")).unwrap();
+    std::fs::create_dir(store_dir.join("meta.json")).unwrap();
+
+    let err = recording.stop().expect_err("stop should fail");
+    assert!(
+        err.to_string().contains("mic pcm stream died"),
+        "first stage error must win over the later meta write: {err}"
+    );
+}
+
+#[test]
+fn failed_start_rolls_back_its_files_and_keeps_user_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+    std::fs::create_dir(&store_dir).unwrap();
+    // A directory named segments.jsonl makes Store::open fail after the
+    // recording's own files were created.
+    std::fs::create_dir(store_dir.join("segments.jsonl")).unwrap();
+
+    let err = match start_recording(bare_params(store_dir.clone(), "test")) {
+        Ok(_) => panic!("start should fail on segments.jsonl"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory);
+
+    for name in ["meta.json", "mic.wav", "monitor.wav"] {
+        assert!(
+            !store_dir.join(name).exists(),
+            "{name} survived a failed start"
+        );
+    }
+    assert!(
+        store_dir.join("segments.jsonl").is_dir(),
+        "user file must survive a failed start"
+    );
+}
+
+#[test]
+fn failed_start_leaves_no_partially_created_files_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("session");
+    std::fs::create_dir(&store_dir).unwrap();
+    std::fs::write(store_dir.join("mic.wav"), b"sentinel").unwrap();
+
+    let err = start_recording(bare_params(store_dir.clone(), "test"));
+    assert!(err.is_err());
+
+    assert!(
+        !store_dir.join("meta.json").exists(),
+        "meta.json created before the collision must be rolled back"
+    );
+    assert_eq!(
+        std::fs::read(store_dir.join("mic.wav")).unwrap(),
+        b"sentinel",
+        "the pre-existing file must not be touched"
+    );
+}
+
+#[test]
+fn reserve_store_dir_cleans_up_when_root_fsync_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+
+    // write+execute without read: candidate mkdir succeeds, opening the
+    // root for fsync fails. Root cannot do this, so skip there.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let can_still_create = {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("probe"))
+            .is_ok()
+    };
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if can_still_create {
+        return;
+    }
+    let _ = std::fs::remove_dir(root.join("probe"));
+
+    assert!(trai::recording::reserve_store_dir(&root).is_err());
+    let leftover: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e: std::io::Result<std::fs::DirEntry>| e.unwrap().file_name())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "failed reservation left a dir behind: {leftover:?}"
+    );
 }
