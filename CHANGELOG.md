@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
+### Fixed
+
+- **CI pins Rust 1.93.1.** CI runs on the tested toolchain instead of
+  floating `stable`. The v0.2.0 tag CI failed on a new Clippy lint
+  introduced in Rust 1.98 after the local green build; v0.2.1 carries
+  the same source plus the toolchain pin, and is the first tag
+  carrying the durable `trai-v0.2.1-linux-x86_64.tar.gz` release asset.
+
 ## [0.2.0] - 2026-09-26
 
 ### Added
@@ -16,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`trai-linux-x86_64-<commit>`, 14-day retention), so a fresh build
   can be downloaded from the Actions run page. These are transient
   run artifacts, not the durable release distribution: per-tag
-  releases attach `trai-v0.2.0-linux-x86_64.tar.gz` to the GitHub
+  releases attach `trai-vX.Y.Z-linux-x86_64.tar.gz` to the GitHub
   Release only after a green tag CI run and a manual curation step,
   so not every tag automatically produces a release asset.
 - **OpenAI-compatible transcription backend.** `whisper_kind = "openai"`
@@ -112,7 +122,8 @@ escape hatch for dead translation backends.
 - **Configuration.** TOML config file with documented example
   (`config.toml.example`). No settings UI.
 
-[unreleased]: https://github.com/victorzhuk/trai/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/victorzhuk/trai/compare/v0.2.1...HEAD
 [0.2.0]: https://github.com/victorzhuk/trai/compare/v0.1.1...v0.2.0
+[0.2.1]: https://github.com/victorzhuk/trai/compare/v0.2.0...v0.2.1
 [0.1.1]: https://github.com/victorzhuk/trai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/victorzhuk/trai/releases/tag/v0.1.0

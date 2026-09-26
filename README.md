@@ -72,15 +72,18 @@ and every `v*` tag and uploads it as a GitHub Actions **run artifact**
 named `trai-linux-x86_64-${{ github.sha }}`. These are transient
 per-run artifacts: retention is 14 days, and downloading from a run's
 page is only useful inside that window. The durable per-tag
-distribution is a release asset (`trai-v0.2.0-linux-x86_64.tar.gz`)
-attached to the corresponding GitHub Release after a green tag CI
-run and a manual curation step — not every `v*` tag automatically
-produces a release asset. Download run artifacts from the run's page
-under the Actions tab. The downloaded archive is plain-zipped —
+distribution, when one is cut, is a release asset
+(`trai-v0.2.1-linux-x86_64.tar.gz`) attached to the corresponding
+GitHub Release after a green tag CI run and a manual curation step.
+Tags alone do not create releases — only a manually curated GitHub
+Release does, so not every `v*` tag automatically produces a release
+asset. Download run artifacts from the run's page under the Actions
+tab. The downloaded archive is plain-zipped —
 `actions/upload-artifact` strips the executable bit on direct
-extraction, so restore it before running. The binary also requires a config file — either `config.toml` in
-the working directory or a path passed as the first CLI argument. Copy
-`config.toml.example` from the repository and fill it in first:
+extraction, so restore it before running. The binary also requires a
+config file — either `config.toml` in the working directory or a path
+passed as the first CLI argument. Copy `config.toml.example` from the
+repository and fill it in first:
 
 ```sh
 chmod +x trai

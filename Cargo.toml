@@ -1,6 +1,6 @@
 [package]
 name = "trai"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Local-first meeting transcribe-and-translate app for Linux: dual PipeWire capture, Whisper transcription, translation, live UI"
 license = "Apache-2.0"
