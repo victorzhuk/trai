@@ -34,7 +34,7 @@ Transcription goes to the whisper server already running on this machine. Transl
 16. As a returning user, I want to delete a Recording behind a confirmation, so that I can clear meetings I don't need without leaving stray audio on disk.
 17. As the operator of this machine, I want configuration in a TOML file, so that I can change target language, backends and defaults in an editor and under version control.
 18. As the operator, I want an ordered list of Translate backends in config, so that switching from the LAN box to a local model is an edit rather than a rebuild.
-19. As a privacy-conscious user, I want transcription and the fallback translation to run locally, so that a work meeting does not leave my machines by default.
+19. As a privacy-conscious user, I want transcription and the fallback translation to run locally by default, so that a work meeting never leaves my machines unless I explicitly configure a cloud transcription endpoint with my own key.
 
 ## Implementation decisions
 

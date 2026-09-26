@@ -29,7 +29,16 @@ language, and writes everything to disk as the meeting runs.
 
 ## Requirements
 
-- Linux with PipeWire
+- Linux with PipeWire, including the `pw-record` tool (on most distros part
+  of the `pipewire` package) — recording is done by spawning two
+  `pw-record` subprocesses.
+- A recent stable Rust toolchain (e.g. via [rustup](https://rustup.rs)) for
+  building from source.
+- Development packages needed by the build (Debian/Ubuntu names; use the
+  equivalents on your distro): `libpipewire-0.3-dev`, `libpulse-dev`,
+  `libdbus-1-dev`, `libxcb1-dev`, `libxkbcommon-dev`, `libwayland-dev`,
+  `libegl-dev`, `libgl1-mesa-dev`, `libfontconfig-dev`,
+  `libfreetype6-dev`.
 - A Whisper server (e.g., [whisper.cpp server](https://github.com/ggerganov/whisper.cpp))
   reachable at a configured URL. Alternatively, any OpenAI-compatible
   transcription endpoint works by setting `whisper_kind = "openai"` — e.g.
@@ -40,7 +49,6 @@ language, and writes everything to disk as the meeting runs.
   off-machine.
 - One or more OpenAI-compatible translation endpoints (e.g., LM Studio,
   Ollama, or any `/v1/chat/completions` server)
-- Rust 1.70+ (for building from source)
 
 ## Getting started
 
@@ -58,6 +66,37 @@ make config
 # Run
 make run
 ```
+
+CI on this repository builds a release binary on every push to `master`
+and every `v*` tag and uploads it as a GitHub Actions **run artifact**
+named `trai-linux-x86_64-${{ github.sha }}`. These are transient
+per-run artifacts: retention is 14 days, and downloading from a run's
+page is only useful inside that window. The durable per-tag
+distribution is a release asset (`trai-v0.2.0-linux-x86_64.tar.gz`)
+attached to the corresponding GitHub Release after a green tag CI
+run and a manual curation step — not every `v*` tag automatically
+produces a release asset. Download run artifacts from the run's page
+under the Actions tab. The downloaded archive is plain-zipped —
+`actions/upload-artifact` strips the executable bit on direct
+extraction, so restore it before running. The binary also requires a config file — either `config.toml` in
+the working directory or a path passed as the first CLI argument. Copy
+`config.toml.example` from the repository and fill it in first:
+
+```sh
+chmod +x trai
+./trai /path/to/config.toml
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to participate, and
+[SECURITY.md](.github/SECURITY.md) for how to report a vulnerability.
+Confidential vulnerability reports should go through GitHub's private
+advisory flow at
+<https://github.com/victorzhuk/trai/security/advisories/new> — that
+is the only confidential channel for security disclosures on this
+repository. Public issues are not confidential and may persist in
+caches, notifications, and edit history; do not post sensitive data
+there. Code-of-conduct and other private conduct matters go to
+<dev@victorzh.uk>; that address is not a security channel.
 
 ## Configuration
 
@@ -88,7 +127,7 @@ request_timeout_ms = 60000
 reprobe_interval_ms = 30000
 
 [[translate.backends]]
-base_url = "http://192.168.1.50:1234"
+base_url = "https://192.168.1.50:1234"
 model = "qwen/qwen3.5-9b"
 # api_key = "optional-bearer-token"
 
@@ -96,6 +135,9 @@ model = "qwen/qwen3.5-9b"
 base_url = "http://localhost:11434"
 model = "qwen3.5:cloud"
 ```
+
+Plain `http://` is only accepted for loopback hosts. Remote backends must
+use `https://`, since the API key rides every request.
 
 ## How it works
 

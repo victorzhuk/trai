@@ -33,6 +33,12 @@ A Segment ends when speech stops, not on a clock — voice activity detection cl
 
 *Avoid:* chunk (reserved for the raw audio buffer before it becomes a Segment), utterance, phrase.
 
+## Transcribe backend
+
+The transcription endpoint a Recording's [[Segment]]s are sent to. Exactly one per run, set by config: either a local whisper.cpp server or an OpenAI-compatible cloud endpoint. Cloud is the operator's explicit opt-in — with it, meeting audio leaves the machine.
+
+*Avoid:* whisper server (that's the local instance, not the concept), STT.
+
 ## Translate backend
 
 An OpenAI-compatible chat endpoint that turns a [[Segment]]'s original text into the configured target language. Config lists them in priority order; the first reachable one wins.

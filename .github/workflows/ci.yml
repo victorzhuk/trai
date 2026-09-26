@@ -7,36 +7,45 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  APT_PACKAGES: >-
+    libpipewire-0.3-dev
+    libpulse-dev
+    libdbus-1-dev
+    libxcb1-dev
+    libxkbcommon-dev
+    libwayland-dev
+    libegl-dev
+    libgl1-mesa-dev
+    libfontconfig-dev
+    libfreetype6-dev
 
 jobs:
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libpipewire-0.3-dev \
-            libpulse-dev \
-            libdbus-1-dev \
-            libxcb1-dev \
-            libxkbcommon-dev \
-            libwayland-dev \
-            libegl-dev \
-            libgl1-mesa-dev \
-            libfontconfig-dev \
-            libfreetype6-dev
+          read -ra packages <<< "$APT_PACKAGES"
+          sudo apt-get install -y "${packages[@]}"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: fmt-check
         run: cargo fmt --check
@@ -50,33 +59,29 @@ jobs:
   release:
     name: release build
     runs-on: ubuntu-latest
+    # Release binary + artifact only on master pushes and tags, not PRs.
+    if: github.event_name == 'push'
+    needs: check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libpipewire-0.3-dev \
-            libpulse-dev \
-            libdbus-1-dev \
-            libxcb1-dev \
-            libxkbcommon-dev \
-            libwayland-dev \
-            libegl-dev \
-            libgl1-mesa-dev \
-            libfontconfig-dev \
-            libfreetype6-dev
+          read -ra packages <<< "$APT_PACKAGES"
+          sudo apt-get install -y "${packages[@]}"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
+      - name: Upload binary as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: trai-linux-x86_64
+          name: trai-linux-x86_64-${{ github.sha }}
           path: target/release/trai
+          if-no-files-found: error
+          retention-days: 14

@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
 ### Added
 
+- **CI builds a release binary on every push to `master` or a `v*` tag.**
+  The binary is uploaded as a GitHub Actions workflow artifact
+  (`trai-linux-x86_64-<commit>`, 14-day retention), so a fresh build
+  can be downloaded from the Actions run page. These are transient
+  run artifacts, not the durable release distribution: per-tag
+  releases attach `trai-v0.2.0-linux-x86_64.tar.gz` to the GitHub
+  Release only after a green tag CI run and a manual curation step,
+  so not every tag automatically produces a release asset.
 - **OpenAI-compatible transcription backend.** `whisper_kind = "openai"`
   sends finished segments to an OpenAI-compatible `/v1/audio/transcriptions`
   endpoint, configured with `whisper_api_key` and `whisper_model`. Local
@@ -101,3 +111,8 @@ escape hatch for dead translation backends.
   failed transcriptions, and degraded-backend warnings.
 - **Configuration.** TOML config file with documented example
   (`config.toml.example`). No settings UI.
+
+[unreleased]: https://github.com/victorzhuk/trai/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/victorzhuk/trai/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/victorzhuk/trai/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/victorzhuk/trai/releases/tag/v0.1.0
